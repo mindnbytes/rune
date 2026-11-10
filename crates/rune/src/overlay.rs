@@ -355,6 +355,7 @@ pub(crate) struct Overlay<T: 'static> {
     parked: Option<Backing>,
     /// `ConfiguredOverlay::release_gpu_when_hidden` (zero) or `release_gpu_after`.
     release_after: Option<Duration>,
+    wayland_top_reserved: Option<u32>,
     /// When a hidden overlay with `release_after` gives its GPU surface back.
     release_at: Option<Instant>,
     cursor: Option<crate::cursor::os::OsCursor>,
@@ -391,7 +392,7 @@ pub(crate) struct Overlay<T: 'static> {
 
 impl<T: 'static> Overlay<T> {
     pub(crate) fn new<S>(configured: impl Into<ConfiguredOverlay<T>>, state: T, app: &AppSpec<S>) -> (Self, OverlayHandle<T>) {
-        let ConfiguredOverlay { spec, options, on_key, on_created, poll, on_focus, compositor, setup, srgb_blend, macos_level, modifier_keys, animate_reveal, release_after } = configured.into();
+        let ConfiguredOverlay { spec, options, on_key, on_created, poll, on_focus, compositor, setup, srgb_blend, macos_level, modifier_keys, animate_reveal, release_after, wayland_top_reserved } = configured.into();
         let shared = Arc::new(Shared { native: Mutex::default(), requests: Mutex::default(), availability: AtomicU8::new(0), failure: Mutex::default(), surface: Mutex::default(), wake: Mutex::new(None), stats: Arc::default() });
         let meter = crate::frame::surface_stats::SurfaceMeter::new(spec.name, shared.stats.clone());
         let text = TextSystem::for_window(app.fonts, app.families);
@@ -426,6 +427,7 @@ impl<T: 'static> Overlay<T> {
             #[cfg(target_os = "windows")]
             fade_length: Duration::ZERO,
             options,
+            wayland_top_reserved,
             canvas_size: spec.size,
             name: spec.name,
             at: Placement { size: spec.size, edge: spec.edge, margin: spec.margin, align: spec.align, inset: spec.inset },
@@ -729,7 +731,7 @@ impl<T: 'static> Overlay<T> {
             _ => None,
         };
         let wake = self.shared.wake.lock().unwrap().clone();
-        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, output, wake)?;
+        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, self.wayland_top_reserved, output, wake)?;
         layer.set_buffer_scale(scale);
         if let Some((w, h)) = layer.configured_size() {
             if w > 0 { self.at.size.0 = w as f32; }

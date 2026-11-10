@@ -149,6 +149,7 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub(crate) modifier_keys: bool,
     pub(crate) animate_reveal: bool,
     pub(crate) release_after: Option<std::time::Duration>,
+    pub(crate) wayland_top_reserved: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,6 +217,9 @@ impl<T: 'static> ConfiguredOverlay<T> {
     /// at rest gives the device back. A prewarmed one still makes its surface only to show.
     /// macOS ignores it: a prewarmed panel retains its pixels at alpha zero.
     pub fn release_gpu_after(mut self, after: std::time::Duration) -> Self { self.release_after = Some(after); self }
+    /// On Wayland layer-shell, place on the top layer and reserve this many pixels.
+    /// Other platforms ignore this prototype option.
+    pub fn wayland_top_reserved(mut self, pixels: u32) -> Self { self.wayland_top_reserved = Some(pixels); self }
     /// The macOS window level (`NSWindow.Level`, e.g. 3 for `.floating`), in place of
     /// `OverlayOptions::level`; `OverlayHandle::set_macos_level` changes it later. At any
     /// level a macOS overlay goes exactly where it's placed, over the menu bar too.
@@ -228,7 +232,7 @@ impl<T: 'static> OverlaySpec<T> {
     }
 
     pub fn options(self, options: OverlayOptions) -> ConfiguredOverlay<T> {
-        ConfiguredOverlay { spec: self, options, on_key: None, on_created: None, poll: None, on_focus: None, compositor: None, setup: None, srgb_blend: true, macos_level: None, modifier_keys: false, animate_reveal: false, release_after: None }
+        ConfiguredOverlay { spec: self, options, on_key: None, on_created: None, poll: None, on_focus: None, compositor: None, setup: None, srgb_blend: true, macos_level: None, modifier_keys: false, animate_reveal: false, release_after: None, wayland_top_reserved: None }
     }
 }
 

@@ -160,9 +160,12 @@ impl Dispatch<WlKeyboard, ()> for State {
                 state.input.push(Input::Physical(crate::PhysicalInput::FocusLost, None));
             }
             wl_keyboard::Event::Keymap { format: wayland_client::WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size } => {
-                use std::io::Read;
-                let mut map = String::new();
-                if size <= 16 * 1024 * 1024 && std::fs::File::from(fd).take(u64::from(size)).read_to_string(&mut map).is_ok() {
+                use std::os::unix::fs::FileExt;
+                const MAX_KEYMAP_SIZE: u32 = 16 * 1024 * 1024;
+                if size == 0 || size > MAX_KEYMAP_SIZE { return; }
+                let mut bytes = vec![0; size as usize];
+                let read = std::fs::File::from(fd).read_exact_at(&mut bytes, 0);
+                if read.is_ok() && let Ok(map) = String::from_utf8(bytes) {
                     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
                     state.xkb = xkb::Keymap::new_from_string(&context, map.trim_end_matches('\0').to_owned(), xkb::KEYMAP_FORMAT_TEXT_V1, xkb::COMPILE_NO_FLAGS).map(|map| xkb::State::new(&map));
                 }
@@ -362,6 +365,7 @@ pub(crate) struct LayerSurface {
     output: Option<WlOutput>,
     seat: Option<WlSeat>,
     options: OverlayOptions,
+    top_reserved: Option<u32>,
     queue: EventQueue<State>,
     state: State,
     layer: ZwlrLayerSurfaceV1,
@@ -372,7 +376,7 @@ pub(crate) struct LayerSurface {
 
 impl LayerSurface {
     /// None when the display isn't Wayland or the compositor lacks layer-shell.
-    pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>, wake: Option<Waker>) -> Option<LayerSurface> {
+    pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, top_reserved: Option<u32>, output_id: Option<u32>, wake: Option<Waker>) -> Option<LayerSurface> {
         let RawDisplayHandle::Wayland(display) = display else { return None };
         // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
         // every overlay; a foreign backend never closes it.
@@ -396,15 +400,15 @@ impl LayerSurface {
         let region = compositor.create_region(&qh, ());
         surface.set_input_region(Some(&region));
         region.destroy();
-        // Preserve existing overlay-layer semantics. There is no layer above Overlay;
-        // relative ordering of peers is compositor policy, unlike AppKit's numeric levels.
-        let layer = shell.get_layer_surface(&surface, output.as_ref(), Layer::Overlay, namespace.to_owned(), &qh, ());
+        // There is no layer above Overlay; layer choice is compositor policy.
+        let reserved = top_reserved;
+        let layer = shell.get_layer_surface(&surface, output.as_ref(), if reserved.is_some() { Layer::Top } else { Layer::Overlay }, namespace.to_owned(), &qh, ());
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_exclusive_zone(0);
+        layer.set_exclusive_zone(reserved.map_or(0, |pixels| pixels.min(i32::MAX as u32) as i32));
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
         let state = State { surface: Some(surface.clone()), want_pointer, want_keys, shapes, ..State::default() };
         let watch = wake.map(|wake| Watch::spawn(conn.backend().poll_fd().as_raw_fd(), wake));
-        let mut this = LayerSurface { registry, seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, output, seat, options: options.clone(), queue, state, layer, surface, display: display.display, watch };
+        let mut this = LayerSurface { registry, seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, output, seat, options: options.clone(), top_reserved, queue, state, layer, surface, display: display.display, watch };
         this.place(at);
         this.surface.commit();
         while this.state.configured.is_none() && !this.state.closed {
@@ -414,6 +418,12 @@ impl LayerSurface {
     }
 
     pub fn place(&mut self, at: Placement) {
+        if let Some(height) = self.top_reserved {
+            self.layer.set_size(0, height.max(1));
+            self.layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+            self.layer.set_margin(0, 0, 0, 0);
+            return;
+        }
         match self.options.placement {
             Some(OverlayPlacement::FullScreen) => {
                 self.layer.set_size(0, 0);

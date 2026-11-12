@@ -1,0 +1,34 @@
+name: Snowbar overlay tests
+
+on:
+  push:
+    branches:
+      - 'snowbar/**'
+  pull_request:
+    branches:
+      - 'snowbar/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snowbar-overlay-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  overlay:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libvulkan-dev
+      - name: Test Rune overlays
+        run: /usr/bin/time -v cargo test --locked -p rune --lib overlay::

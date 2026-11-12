@@ -20,7 +20,7 @@ pub(crate) struct Key {
     pub glyph: u32,
     pub coords: u64,
     pub skew: u8,
-    pub hinted: u32,
+    pub hinted: u64,
 }
 
 /// Where a glyph's record starts, its ink box in font units (x0, y0, x1, y1, y up) and the
@@ -138,6 +138,14 @@ impl OutlineStore {
         self.glyphs.clear();
         self.hints.clear();
         true
+    }
+
+    /// The texels records fill so far (texel 0 included), as a recording keeps them.
+    pub(crate) fn used_texels(&self) -> &[[u32; 4]] { &self.texels[..self.used] }
+
+    /// A store holding `texels` (a recording's `used_texels`) and nothing else.
+    pub(crate) fn from_texels(texels: Vec<[u32; 4]>) -> OutlineStore {
+        OutlineStore { used: texels.len(), texels, ..OutlineStore::default() }
     }
 
     /// Texel `i`, zero past the end.

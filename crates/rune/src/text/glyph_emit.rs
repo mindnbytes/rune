@@ -102,12 +102,20 @@ impl TextSystem {
     /// `origin` (device px). Only that grapheme's glyphs are visited. `_scale` is unused (the
     /// run holds its scale); it stays for source compatibility.
     pub fn glyphs_in(&mut self, run: &RunLayout, at: usize, _scale: f32, origin: [f32; 2], out: &mut Vec<GlyphQuad>) {
+        self.glyphs_in_scaled(run, at, origin, 1.0, out);
+    }
+
+    /// [`Self::glyphs_in`] with the run magnified `k` times about `origin`: pen positions scale
+    /// and each glyph rasterizes at `k` times its size, as [`Self::glyphs_in_band`] does for a
+    /// paragraph, so a cell under a zoom draws as crisply as the words beside it.
+    pub(crate) fn glyphs_in_scaled(&mut self, run: &RunLayout, at: usize, origin: [f32; 2], k: f32, out: &mut Vec<GlyphQuad>) {
         let Some(i) = run.grapheme(at) else { return };
         let glyphs = run.graphemes[i].2 as usize..run.graphemes[i + 1].2 as usize;
         for g in &run.glyphs[glyphs] {
             let face = &run.faces[g.face as usize];
-            let baseline = (origin[1] + face.face.baseline).round();
-            self.push_glyph(&face.face, &face.coords, g.id, [origin[0] + g.x, baseline + g.y], 1.0, at as u32, out);
+            let baseline = (origin[1] + face.face.baseline * k).round();
+            let pen = if k == 1.0 { [origin[0] + g.x, baseline + g.y] } else { [origin[0] + g.x * k, baseline + g.y * k] };
+            self.push_glyph(&face.face, &face.coords, g.id, pen, k, at as u32, out);
         }
     }
 
@@ -138,6 +146,9 @@ impl TextSystem {
             skew,
             bold: face.bold,
         };
+        let miss = crate::marks::counting() && !self.atlas.map.contains_key(&key);
+        if miss { crate::marks::add("text.glyphs", 1); }
+        let _raster = crate::marks::Timed::start("text.raster_ns", miss);
         let entry = match self.atlas.map.get(&key) {
             Some(e) => {
                 let mask = e.mask();
@@ -154,6 +165,18 @@ impl TextSystem {
                     out.push(c.quad(gx, gy, glide, ink, byte));
                     return Placed::Other;
                 }
+                let landed = |placed: Rasterized, out: &mut Vec<GlyphQuad>| match placed {
+                    Rasterized::Placed(a) => {
+                        out.push(atlas_quad(a, fx, fy, ink, byte));
+                        Placed::Atlas(a, [subpx, subpy])
+                    }
+                    Rasterized::Empty => Placed::Empty([subpx, subpy]),
+                    Rasterized::Unplaced => { crate::marks::text_missed(); Placed::Other }
+                };
+                // A mask an earlier launch saved: no colour check, outline or fill.
+                if windfoil && let Some(placed) = self.cached_mask(&key, face) {
+                    return landed(placed, out);
+                }
                 let Some(font_ref) = FontRef::from_index(font.data.as_ref(), font.index as usize) else {
                     return Placed::Other;
                 };
@@ -164,7 +187,9 @@ impl TextSystem {
                     .hint(false)
                     .normalized_coords(coords.iter().copied())
                     .build();
-                if let Some((pixels, at)) = rasterize_color(&mut scaler, glyph as u16) {
+                // COLR v1 first (Windows 11's emoji, COLR v1 Noto Color Emoji), then swash's COLR v0 and bitmaps.
+                let v1 = if scaler.has_color_outlines() { super::colr::rasterize(font.data.as_ref(), font.index, glyph, font_size, coords) } else { None };
+                if let Some((pixels, at)) = v1.or_else(|| rasterize_color(&mut scaler, glyph as u16)) {
                     self.color_bytes = self.color_bytes.saturating_add((at.width as usize) * (at.height as usize) * 4);
                     self.color_pixels.push(pixels);
                     let index = self.color_pixels.len() as u32;
@@ -174,15 +199,11 @@ impl TextSystem {
                     return Placed::Other;
                 }
                 // Windfoil masks place their own entries (GPU-filled ones are queued, not uploaded).
-                if windfoil && let Some(placed) = self.windfoil_mask(key, face, coords, font_size, [subpx, subpy]) {
-                    return match placed {
-                        Rasterized::Placed(a) => {
-                            out.push(atlas_quad(a, fx, fy, ink, byte));
-                            Placed::Atlas(a, [subpx, subpy])
-                        }
-                        Rasterized::Empty => Placed::Empty([subpx, subpy]),
-                        Rasterized::Unplaced => Placed::Other,
-                    };
+                if windfoil {
+                    self.note_mask_font(face);
+                    if let Some(placed) = self.windfoil_mask(key, face, coords, font_size, [subpx, subpy]) {
+                        return landed(placed, out);
+                    }
                 }
                 let (phase_x, shift_y) = (subpx as f32 / coretext_match::PHASES, subpy as f32 / GLIDE_PHASES as f32);
                 #[cfg(target_os = "windows")]
@@ -225,7 +246,7 @@ impl TextSystem {
                         self.atlas.map.insert(key, Residency::Blank);
                         None
                     }
-                    Rasterized::Unplaced => return Placed::Other,
+                    Rasterized::Unplaced => { crate::marks::text_missed(); return Placed::Other }
                 }
             }
         };

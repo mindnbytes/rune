@@ -91,6 +91,8 @@ impl<S: 'static> Runtime<S> {
         // would wake the host again every frame interval.
         let due = self.wake_deadlines.partition_point(|t| *t <= self.clock);
         self.wake_deadlines.drain(..due);
+        // A glyph mask cache write that came due while nothing draws (`mask_cache`).
+        let _ = self.text.mask_cache_frame(false);
         let patched = self.patch_pending();
         let Some(poll) = self.poll else { return patched };
         let mut one = self.transaction();
@@ -143,7 +145,7 @@ impl<S: 'static> Runtime<S> {
         #[cfg(feature = "hot")]
         if self.hot.is_some() { return false; }
         !self.animating && !self.stale() && !self.settle && self.loop_wake.is_none() && self.window_frame.is_none()
-            && self.hover_pending.is_empty() && !self.tooltip_waiting() && !self.press_repeat_waiting() && !self.drag_ends_pending()
+            && !self.hover_delays.waiting() && !self.tooltip_waiting() && !self.press_repeat_waiting() && !self.drag_ends_pending()
             && self.drag_out_request.is_none() && !self.files_held() && !self.live_pending()
             && self.surfaces.is_empty() && !self.steps_frames()
     }

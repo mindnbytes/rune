@@ -16,6 +16,8 @@ pub(super) enum FaceKind {
     Color,
     /// Its `OS/2` ranges claim Han, kana or Hangul.
     Cjk,
+    /// It carries TrueType hints (a font program, `fpgm`).
+    Hinted,
 }
 
 /// Rest ppem up to which CJK faces draw their TrueType-hinted outlines.
@@ -85,16 +87,22 @@ impl TextSystem {
         if kind == FaceKind::Color {
             return Found::Elsewhere;
         }
-        let hint = if self.smoothing.look().is_some_and(|l| l.hint == coretext_match::OutlineHint::Auto) {
+        let look = self.smoothing.look().map(|l| l.hint);
+        let hint = if look == Some(coretext_match::OutlineHint::Auto) {
             outline::Hinting::Auto(ppem)
         } else if kind == FaceKind::Cjk && ppem <= CJK_HINT_MAX {
             outline::Hinting::TrueType(ppem)
+        } else if cfg!(not(target_os = "macos")) && look == Some(coretext_match::OutlineHint::DirectWrite) && kind == FaceKind::Hinted && gasp_grid_fits(font_ref, ppem) {
+            outline::Hinting::Vertical(ppem)
         } else {
             outline::Hinting::None
         };
         let key = outline::Key { font: face_key.0, index: face_key.1, glyph, coords: face.coords_key, skew, hinted: hint.key() };
         let scale_cx = &mut self.scale_cx;
-        match self.atlas.outlines.glyph(key, || outline::extract(scale_cx, font_ref, face_key.1, coords, glyph as u16, skew, hint)) {
+        match self.atlas.outlines.glyph(key, || {
+            let _built = crate::marks::Timed::start("text.outline_ns", true);
+            outline::extract(scale_cx, font_ref, face_key.1, coords, glyph as u16, skew, hint)
+        }) {
             outline::Found::Outline(g) => Found::Draws(g, matches!(hint, outline::Hinting::TrueType(_))),
             outline::Found::Empty => Found::Blank,
             outline::Found::Full => Found::Elsewhere,
@@ -175,11 +183,10 @@ impl TextSystem {
                 None => Rasterized::Unplaced,
             });
         }
-        let coverage: Vec<u8> = (0..h as u32).flat_map(|row| (0..w as u32).map(move |col| (row, col))).map(|(row, col)| {
-            let local = [col as f32 + 0.5 - fill.pen[0], fill.pen[1] - (row as f32 + 0.5)];
-            // The CPU has Windfoil's box coverage only: a Slug mask filled here is Windfoil's.
-            (outline::coverage(&self.atlas.outlines, fill.record, fill.hint, local, fill.scale, fill.radius, 0.5) * 255.0).round() as u8
-        }).collect();
+        // The CPU has Windfoil's box coverage only: a Slug mask filled here is Windfoil's. With no
+        // renderer to match, it's filled as if at its page's origin.
+        let mut coverage = Vec::with_capacity((w * h) as usize);
+        outline::fill_mask(&self.atlas.outlines, &fill, [0, 0], w as u32, h as u32, &mut coverage);
         Some(match self.atlas.put(w as u32, h as u32, &coverage, (left + nudge) as i32, -top as i32) {
             Some(mask) => {
                 self.atlas.map.insert(key, Residency::Uploaded(mask));
@@ -220,5 +227,16 @@ fn face_kind(font: FontRef<'_>) -> FaceKind {
     }
     // ulUnicodeRange2: Hiragana (bit 49), Hangul syllables (56), CJK unified ideographs (59).
     let range2 = font.table(u32::from_be_bytes(*b"OS/2")).and_then(|t| t.get(46..50)).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    if range2 & (1 << 17 | 1 << 24 | 1 << 27) != 0 { FaceKind::Cjk } else { FaceKind::Plain }
+    if range2 & (1 << 17 | 1 << 24 | 1 << 27) != 0 { return FaceKind::Cjk; }
+    if font.table(u32::from_be_bytes(*b"fpgm")).is_some() { FaceKind::Hinted } else { FaceKind::Plain }
+}
+
+/// Whether `font`'s `gasp` table asks for grid fitting at `ppem` (`GASP_GRIDFIT` or
+/// `GASP_SYMMETRIC_GRIDFIT`), as DirectWrite reads it; a face without one is grid fitted.
+fn gasp_grid_fits(font: FontRef<'_>, ppem: f32) -> bool {
+    let Some(gasp) = font.table(u32::from_be_bytes(*b"gasp")) else { return true };
+    let u16_at = |i: usize| gasp.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let count = u16_at(2).unwrap_or(0) as usize;
+    let size = ppem.round() as u32;
+    (0..count).filter_map(|k| Some((u16_at(4 + 4 * k)?, u16_at(6 + 4 * k)?))).find(|&(max, _)| size <= u32::from(max)).is_none_or(|(_, flags)| flags & (0x0001 | 0x0004) != 0)
 }

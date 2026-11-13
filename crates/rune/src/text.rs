@@ -11,9 +11,8 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use crate::runtime::{HashMap as FxHashMap, HashSet as FxHashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 
-use parley::fontique::{Blob, Collection, CollectionOptions, FallbackKey, FamilyId, Script, SourceCache};
+use parley::fontique::{Collection, CollectionOptions, FallbackKey, FamilyId, Script, SourceCache};
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontFamilyName, FontStyle, FontWeight, Layout, LayoutContext,
     LineHeight, PositionedLayoutItem, StyleProperty,
@@ -29,10 +28,14 @@ mod atlas;
 mod atlas_fill;
 pub(crate) use atlas_fill::QueuedFill;
 mod case;
+mod collate;
+pub use collate::compare_names;
 mod colr;
 mod color_icon;
 mod cursor;
 mod decorations;
+pub(crate) mod face_weights;
+pub use face_weights::{FaceWeights, set_face_weights};
 mod families;
 #[doc(hidden)]
 pub mod fill_bench;
@@ -44,6 +47,8 @@ mod ltr_units;
 pub use ltr_units::ltr_units;
 pub mod mask_cache;
 mod paragraphs;
+#[cfg(target_arch = "wasm32")]
+mod platform_face;
 mod span;
 mod system_fonts;
 mod system_weight;
@@ -91,6 +96,8 @@ pub use hash::text_hash;
 pub(crate) use hash::{directed, elide_key, shape_key};
 pub(crate) use families::choose_families;
 pub use measure::{FamiliesGuard, TextInk, advance, content_widths, font_epoch, ink, measure, measure_with, with_families};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use measure::line_starts;
 pub use rich_layout::RichLayoutOptions;
 pub use run::{Run, RunLayout};
 pub(crate) use case::Source as CaseSource;
@@ -132,6 +139,18 @@ use system_fonts::{LoadedFiles, family_list, load_installed, load_system_mono, n
 use system_fonts::system_font_files;
 #[cfg(test)]
 use system_fonts::CJK_FONT_FILES;
+
+/// How strictly Japanese and Chinese lines break, one switch. `Strict` (JIS X 4051, UAX #14's
+/// default) never starts a line with a small kana (ぁ ッ ャ), ー or 々. `Normal` is Chromium's
+/// `line-break: auto`, which lets them start one. Native Japanese readers decide which reads
+/// better; this is the one place to change.
+const LINE_BREAK: parley::LineBreak = parley::LineBreak::Strict;
+
+/// The family every stack ends in: in a browser, the face the page draws (`platform_face`).
+#[cfg(target_arch = "wasm32")]
+const PLATFORM_FAMILY: &[&str] = platform_face::FAMILY;
+#[cfg(not(target_arch = "wasm32"))]
+const PLATFORM_FAMILY: &[&str] = &[];
 
 /// Lean of a synthetic oblique, in degrees, for faces with no italic.
 const SYNTHETIC_OBLIQUE: u8 = 12;
@@ -207,6 +226,9 @@ pub struct TextSystem {
     color_glyphs: GlyphMap<ColorGlyph>,
     color_pixels: Vec<crate::pixels::Pixels>,
     color_bytes: usize,
+    /// Colour glyphs placed so far, painted or from the mask cache: with the atlas's count, a
+    /// change the cache's next write must carry.
+    color_placed: u64,
     color_icons: color_icon::ColorIcons,
     /// Layouts shaped, a running count (shaping work counter for perf gates).
     pub shaped: u32,
@@ -272,7 +294,7 @@ impl TextSystem {
         let list: &[&'static [u8]] = if fonts.is_empty() { DEFAULT_FONTS } else { fonts };
         let mut registered = Vec::new();
         for data in list {
-            let mut added: Vec<FamilyId> = collection.register_fonts(Blob::new(Arc::new(*data)), None).into_iter().map(|(id, _)| id).collect();
+            let mut added = face_weights::register(&mut collection, data);
             added.sort_unstable();
             registered.extend(added);
         }
@@ -283,12 +305,15 @@ impl TextSystem {
         {
             let fill: Vec<bool> = default_fonts::DEFAULT_FAMILIES.iter().map(|f| fonts.is_empty() || collection.family_id(f).is_none()).collect();
             for (data, _) in DEFAULT_FONTS.iter().zip(&fill).filter(|(_, fill)| **fill && !fonts.is_empty()) {
-                collection.register_fonts(Blob::new(Arc::new(*data)), None);
+                face_weights::register(&mut collection, data);
             }
             if fill[0] {
                 full_faces::note_embedded_inter();
             }
         }
+        // In a browser, the face the page draws what no other font has (`platform_face`).
+        #[cfg(target_arch = "wasm32")]
+        platform_face::register(&mut collection);
         // No system font loads here: each comes the first time a text needs it (`load_fallbacks`).
         let cjk = register_cjk_fallbacks(&mut collection, &registered, families);
         #[cfg(target_arch = "wasm32")]
@@ -327,6 +352,7 @@ impl TextSystem {
             color_glyphs: GlyphMap::default(),
             color_pixels: Vec::new(),
             color_bytes: 0,
+            color_placed: 0,
             color_icons: color_icon::ColorIcons::default(),
             shaped: 0,
             rebroken: 0,
@@ -450,6 +476,23 @@ impl TextSystem {
     /// How glyphs rasterise and place ([`FontSmoothing`]).
     pub fn font_smoothing(&self) -> FontSmoothing { self.requested }
 
+    /// What the atlas quads of a still, unscaled text depend on besides its layout, origin and
+    /// inks: the atlas's clock (a page evicted or added moves masks) and how glyphs rasterise.
+    /// Quads emitted under one key can be drawn again while it holds (`El::grid` rows).
+    pub(crate) fn emit_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rune_motion::Fx::default();
+        (self.atlas.clock, self.smoothing, self.apple.pipeline(), self.atlas.lcd).hash(&mut h);
+        self.glide.map(f32::to_bits).hash(&mut h);
+        h.finish()
+    }
+
+    /// Marks the atlas page `quad` samples as drawn this frame, as emitting it did, so a quad
+    /// drawn again from a cache keeps its page from eviction.
+    pub(crate) fn touch_quad(&mut self, page: u16, texels: u32) {
+        self.atlas.touch(page, texels);
+    }
+
     /// How far each gliding glyph mask's ink sits below the top of its quad, in device px, keyed
     /// as `blend::apron_key` keys its instance: a DirectWrite or Windfoil mask keeps one box across its y
     /// phases and moves its ink down that box by its phase, so the box moves a whole pixel only
@@ -478,6 +521,7 @@ impl TextSystem {
         self.smoothing = mode.drawn(self.lcd_ok());
         self.apple.set_pipeline(self.smoothing.pipeline());
         self.atlas.lcd = self.smoothing.lcd();
+        self.atlas.lcd_wanted = mode.lcd();
     }
 
     /// Whether subpixel text draws here now: the renderer draws outlines and blends by channel,
@@ -699,7 +743,7 @@ impl TextSystem {
         let with_symbols = |primary, extra: &[&'static str]| {
             family_list(primary, system, self.sans.as_str())
                 .into_iter()
-                .chain(extra.iter().chain(self.symbol_families.iter()).chain(math).map(|name| FontFamilyName::named(name)))
+                .chain(extra.iter().chain(self.symbol_families.iter()).chain(math).chain(PLATFORM_FAMILY).map(|name| FontFamilyName::named(name)))
                 .collect::<Vec<_>>()
         };
         let sans = match style.family {
@@ -773,6 +817,7 @@ impl TextSystem {
                 b.push_default(parley::FontVariations::List(std::borrow::Cow::Owned(settings)));
             }
             b.push_default(LineHeight::Absolute(style.line_px()));
+            b.push_default(StyleProperty::LineBreak(LINE_BREAK));
             if wrap_anywhere {
                 b.push_default(StyleProperty::OverflowWrap(parley::OverflowWrap::Anywhere));
             }

@@ -286,6 +286,15 @@ impl El {
         }
         self
     }
+    /// Break this text's lines greedily when the app wraps text prettily
+    /// ([`crate::text::set_pretty_wrap`]): text that grows while it's read, such as a reply
+    /// still streaming in, whose last lines would move as each word arrives.
+    pub fn wrap_greedy(mut self) -> Self {
+        if let Some(t) = &mut self.text {
+            t.greedy = true;
+        }
+        self
+    }
     /// Whether this is text that wraps (`.wrap()`), for containers that let such text shrink
     /// to their width.
     pub fn wraps(&self) -> bool {
@@ -439,6 +448,15 @@ impl El {
             i.placeholder = s.into();
             i.placeholder_color = c;
             i.placeholder_inked = true;
+        }
+        self
+    }
+    /// Lay this field's placeholder out in `style` rather than the field's own, as CSS's
+    /// `::placeholder` can: a phone's field types at 16 pt (so iOS doesn't zoom to it) while its
+    /// hint keeps the design's size.
+    pub fn placeholder_font(mut self, style: TextStyle) -> Self {
+        if let Some(i) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
+            i.placeholder_style = Some(style);
         }
         self
     }

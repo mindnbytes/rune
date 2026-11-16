@@ -42,6 +42,9 @@ pub mod fill_bench;
 pub(crate) mod full_faces;
 mod language;
 pub use language::set_language;
+mod layout_id;
+pub(crate) use layout_id::LayoutId;
+use layout_id::LayoutIds;
 mod line_break;
 mod ltr_units;
 pub use ltr_units::ltr_units;
@@ -66,7 +69,9 @@ mod glyph_emit;
 mod hash;
 mod hidden_axes;
 mod inline_fit;
-mod hairline;
+mod aaa;
+mod area;
+mod convex;
 pub(crate) mod icon;
 mod layout_cache;
 mod macos;
@@ -76,6 +81,9 @@ mod measure;
 pub(crate) mod outline;
 pub use outline::Outline;
 mod pill_chips;
+mod pretty;
+pub use pretty::set_pretty_wrap;
+pub(crate) use pretty::pretty_wrap;
 mod rich_layout;
 mod run;
 pub(crate) use pill_chips::{bare_icons, pill_chips};
@@ -98,6 +106,7 @@ pub(crate) use families::choose_families;
 pub use measure::{FamiliesGuard, TextInk, advance, content_widths, font_epoch, ink, measure, measure_with, with_families};
 #[cfg(target_arch = "wasm32")]
 pub(crate) use measure::line_starts;
+pub(crate) use measure::lend;
 pub use rich_layout::RichLayoutOptions;
 pub use run::{Run, RunLayout};
 pub(crate) use case::Source as CaseSource;
@@ -110,10 +119,10 @@ use glyph_emit::Face;
 use hidden_axes::hidden_axes;
 use layout_cache::{Cache, Entry};
 pub(crate) use layout_cache::Keep;
-pub(crate) use paragraphs::{ParagraphLayout, Piece, TextFlow, TextLayout};
+pub(crate) use paragraphs::{ParagraphLayout, Piece, TextFlow, TextLayout, common_end, common_start};
 #[cfg(test)]
 use layout_cache::STALE_BYTES;
-pub use icon::{Icon, icon_coverage, set_icon_swap, set_icon_swap_size};
+pub use icon::{Icon, icon_coverage, icon_coverage_placed, set_icon_swap, set_icon_swap_size};
 pub(crate) use icon::Facing;
 use icon::rasterize_icon;
 use rich_layout::mono_tab_stops;
@@ -132,7 +141,6 @@ use atlas::{AtlasGlyph, COLOR_GLYPH_BUDGET, ColorGlyph, GlyphKey, GlyphMap, Rast
 use atlas::{MAX_OVERFLOW_PAGES, MAX_STEADY_PAGES};
 #[cfg(test)]
 pub(crate) use glyph_emit::GLIDE_PHASES;
-use line_break::break_lines_with_blocks;
 use span::PILL_BOX;
 use system_fonts::{LoadedFiles, family_list, load_installed, load_system_mono, named_list, names_system_mono, register_cjk_fallbacks};
 #[cfg(any(test, not(target_arch = "wasm32")))]
@@ -188,8 +196,17 @@ pub struct TextSystem {
     paragraphs: Cache<Rc<ParagraphLayout>>,
     /// The last by-paragraph layout made this commit, which its text at another width breaks from.
     last_paragraphs: Option<Rc<ParagraphLayout>>,
+    /// The bytes the last two texts compared this commit share at their start and end, and the
+    /// two texts (address and length): measuring a field at its two widths compares it once.
+    last_diff: Option<([usize; 4], usize, usize)>,
+    /// A long paste's lines as one width's keying read them this layout pass, for the other's.
+    line_scan: Option<paragraphs::LineScan>,
+    /// Printable ASCII's advances and line height per style and scale (`paragraphs::AsciiLine`).
+    ascii: HashMap<u64, Option<Rc<paragraphs::AsciiLine>>>,
     runs: Cache<Rc<RunLayout>>,
     generation: u32,
+    /// The id of the layout at each address one was built or re-broken at (`layout_id`).
+    layout_ids: LayoutIds,
     /// The slots' families as named; `sans` and `mono` are the lists text asks for.
     families: (String, String),
     /// The `choose_families` change these slots follow.
@@ -289,6 +306,9 @@ impl TextSystem {
     /// bundled sans and mono fallbacks, since there are no system fonts to discover.
     /// `families` names the sans and mono slots; others are selectable with `Family::Named`.
     pub fn new(fonts: &[&'static [u8]], families: (&str, &str)) -> Self {
+        // Windows' own word dictionaries for the scripts that need one (loaded when first asked).
+        #[cfg(all(target_os = "windows", not(feature = "segmenter-dictionaries")))]
+        crate::platform::win32::segmenter::install();
         measure::note_fonts(fonts, families);
         let mut collection = Collection::new(CollectionOptions { shared: false, system_fonts: false });
         let list: &[&'static [u8]] = if fonts.is_empty() { DEFAULT_FONTS } else { fonts };
@@ -329,8 +349,12 @@ impl TextSystem {
             elisions: Default::default(),
             paragraphs: Default::default(),
             last_paragraphs: None,
+            last_diff: None,
+            line_scan: None,
+            ascii: HashMap::default(),
             runs: Default::default(),
             generation: 0,
+            layout_ids: LayoutIds::default(),
             families: (families.0.to_owned(), families.1.to_owned()),
             chosen: 0,
             language: None,
@@ -509,8 +533,8 @@ impl TextSystem {
     /// platform: 1 (coverage as is) on macOS and iOS, and a browser's text gamma for `Off`
     /// elsewhere.
     pub fn coverage_exponent(&self, fill: [f32; 4]) -> f32 {
-        let apple = cfg!(any(target_os = "macos", target_os = "ios"));
-        coretext_match::coverage_exponent(self.smoothing, fill, apple, cfg!(target_os = "windows"))
+        let apple = coretext_match::apple_coverage();
+        coretext_match::coverage_exponent(self.smoothing, fill, apple, coretext_match::windows_gamma())
     }
 
     /// Rasterise and place glyphs in `mode` from the next placement on, with its CoreGraphics
@@ -598,6 +622,7 @@ impl TextSystem {
         max_width: Option<f32>,
         align: Alignment,
         wrap_anywhere: bool,
+        pretty: bool,
         keep: Keep,
         base: parley::BaseDirection,
     ) -> Rc<Layout<Ink>> {
@@ -609,7 +634,9 @@ impl TextSystem {
         // breaking adds the width, alignment and block indents. A layout cached at one width
         // is re-broken at another rather than shaped again.
         let shape_key = shape.unwrap_or_else(|| hash::directed(shape_key(text, spans, style, scale, wrap_anywhere, pills), base));
-        let key = hash::break_key(shape_key, max_width, align, has_indented_blocks.then_some(blocks));
+        // Pretty wrapping breaks only wrapped proportional text again.
+        let pretty = pretty && max_width.is_some() && !matches!(style.family, Family::Mono | Family::SystemMono);
+        let key = hash::break_key(shape_key, max_width, align, has_indented_blocks.then_some(blocks)) ^ if pretty { 0x7072_6574_7479_0001 } else { 0 };
         let g = self.generation;
         if cache && let Some(Entry { value: l, used, .. }) = self.layouts.get_mut(&key) {
             *used = g;
@@ -635,13 +662,8 @@ impl TextSystem {
                 !r.is_empty() && text.is_char_boundary(r.start) && text.is_char_boundary(r.end) && !text.as_bytes()[r.clone()].contains(&b'\n')
             })
             .collect();
-        let break_lines = |layout: &mut Layout<Ink>| {
-            if has_indented_blocks || !pills.is_empty() {
-                break_lines_with_blocks(layout, blocks, style.size, scale, max_width);
-            } else {
-                layout.break_all_lines(max_width);
-            }
-        };
+        let indented = has_indented_blocks || !pills.is_empty();
+        let break_lines = |layout: &mut Layout<Ink>| line_break::break_new(layout, text, blocks, indented, style.size, scale, max_width, pretty);
         if cache
             && let Some(prev) = self.shapes.get(&shape_key).copied()
             && let Some(Entry { value: shaped, used, .. }) = self.layouts.get(&prev)
@@ -655,6 +677,8 @@ impl TextSystem {
             let layout = Rc::make_mut(&mut l);
             break_lines(layout);
             layout.align(align, AlignmentOptions::default());
+            // Re-broken, in place or as a copy: whatever it draws now is its own.
+            self.layout_ids.build(&l);
             self.layouts.insert(key, Entry::new(l.clone(), g, text.len(), shape_key));
             self.shapes.insert(shape_key, key);
             return l;
@@ -952,6 +976,7 @@ impl TextSystem {
         }
         layout.align(align, AlignmentOptions::default());
         let l = Rc::new(layout);
+        self.layout_ids.build(&l);
         if cache {
             self.layouts.insert(key, Entry::new(l.clone(), g, text.len(), shape_key));
             self.shapes.insert(shape_key, key);
@@ -965,7 +990,7 @@ impl TextSystem {
     /// Size in points, rounded up to whole device pixels so layout stays on the pixel grid.
     pub fn measure(&mut self, text: &str, style: TextStyle, scale: f32) -> (f32, f32) {
         let l = self.layout_rich(text, &[], style, scale, None);
-        (l.full_width().ceil() / scale, layout_height(&l, style, scale) / scale)
+        (crate::runtime::text_width(l.full_width()) / scale, layout_height(&l, style, scale) / scale)
     }
 
     /// The atlas quad for `icon` at `px` device pixels square, top-left at `origin`.

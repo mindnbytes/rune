@@ -73,7 +73,7 @@ impl<S: 'static> Runtime<S> {
     pub(crate) fn observe_pointer(&mut self, x: f32, y: f32) -> bool {
         if self.pointer == Some((x, y)) { return false; }
         let visual_changed = self.nodes.iter().enumerate().any(|(i, n)| {
-            if n.vis.hover().a <= 0.0 && n.vis.press().a <= 0.0 && n.handlers.get().is_none_or(|h| h.press_scale.is_none()) { return false; }
+            if n.vis.hover().a <= 0.0 && !n.vis.tracks_press() && n.handlers.get().is_none_or(|h| h.press_scale.is_none()) { return false; }
             let inside = |p: Option<(f32, f32)>| p.is_some_and(|(x, y)| self.node_contains(i, x, y));
             inside(self.pointer) != inside(Some((x, y)))
         });
@@ -84,7 +84,9 @@ impl<S: 'static> Runtime<S> {
         visual_changed || help_changed || self.queue.len() != queued || self.press.inside() != capture_inside
     }
 
-    pub(crate) fn pointer_captured(&self) -> bool { self.press.is_held() || self.secondary.is_held() }
+    /// A button holds the pointer: the OS keeps sending its moves to this window, and a leave
+    /// waits for the release.
+    pub(crate) fn pointer_captured(&self) -> bool { self.press.is_held() || self.secondary.is_held() || self.tint.path().is_some() }
 
     /// The host's window content top-left in desktop pixels; `None` where it has none.
     pub(crate) fn set_window_pixels(&mut self, pixels: Option<(i32, i32)>) {
@@ -114,6 +116,7 @@ impl<S: 'static> Runtime<S> {
         self.input_click.clear();
         self.drop_press();
         self.secondary = capture::Secondary::Up;
+        self.tint = capture::Tint::Up;
         self.pointer_leave();
         self.drag_files_leave();
     }
@@ -214,7 +217,7 @@ impl<S: 'static> Runtime<S> {
         // A press is the hand's: hover follows the pointer through moving layout.
         self.release_hover_hold();
         self.focus.step(focus_machine::FocusEvent::Pointed);
-        self.press_help(x, y);
+        self.dismiss_help();
         // A press cancels the waits to report an enter; the next move after it starts them again.
         self.press_hover_delays();
         self.hover_paused = true;
@@ -326,6 +329,8 @@ impl<S: 'static> Runtime<S> {
 
     pub fn pointer_up(&mut self, x: f32, y: f32) {
         if self.autoscroll_release(crate::PointerButton::Primary) { self.pointer = Some((x, y)); return; }
+        #[cfg(target_os = "linux")]
+        self.primary_released();
         if self.press.held().is_some_and(|h| h.button != crate::PointerButton::Primary) {
             self.pointer = Some((x, y));
             return;
@@ -483,12 +488,16 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// The innermost scroll viewport at (x, y) that moves on the horizontal axis or the vertical.
+    /// One whose content fits on that axis is passed over for the one around it, as Chromium
+    /// skips a scroller with nothing to scroll: a list of sections, each its own viewport as
+    /// tall as its rows, scrolls from over any row.
     pub(super) fn scroll_at_axis(&self, x: f32, y: f32, horizontal: bool) -> Option<NodeId> {
         self.nodes
             .iter()
             .enumerate()
             .rev()
             .filter(|(i, n)| n.scroll.is_some() && n.scroll_axes.has(horizontal) && !self.subtree_exiting(*i) && self.allowed(*i))
+            .filter(|(_, n)| self.scrolls.get(&n.id).is_some_and(|st| if horizontal { st.x.max } else { st.max } > 0.0))
             .find(|(i, _)| self.node_contains(*i, x, y))
             .map(|(_, n)| n.id)
     }

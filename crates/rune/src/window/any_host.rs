@@ -8,6 +8,7 @@ impl<S: 'static> AnyHost for Host<S> {
     }
     fn finished(&self) -> bool { self.life.finished() }
     fn keeps_loop(&self) -> bool { self.keeps_loop }
+    fn closing_ends_app(&mut self) { self.ends_app = true; }
     fn key(&self) -> Option<&str> { Some(self.native_handle.key()) }
     fn reopen_candidate(&self) -> crate::platform::reopen::Candidate {
         let shown = self.shown_win();
@@ -210,9 +211,11 @@ impl<S: 'static> Host<S> {
         if let Some(w) = &mut self.win && !self.life.shown() && w.hidden_pace.take_due(Instant::now()) {
             w.request_redraw();
         }
-        // A covered window with motion on screen looks again whether it's still covered (`look`).
-        if let Some(w) = &self.win && self.life.covered() && look_deadline(Some(w)).is_some_and(|at| at <= Instant::now()) {
-            w.request_redraw();
+        // A covered window with motion on screen looks again whether it's still covered (`look`),
+        // without a frame: asked for while covered, one would draw (`CoveredDraw`) for no one.
+        #[cfg(target_os = "windows")]
+        if self.win.as_ref().is_some_and(|w| look_deadline(Some(w)).is_some_and(|at| at <= Instant::now())) && self.life.covered() {
+            self.look();
         }
         if matches!(cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
             && timer_deadline(&self.rt).is_some_and(|deadline| deadline <= Instant::now())
@@ -281,12 +284,11 @@ impl<S: 'static> Host<S> {
         }
         self.hidden_input(event_loop);
         self.a11y_turn();
-        // The first idle turn after a CPU-drawn window's first frame starts its GPU.
+        // After the first frame: its on_ready, hooks, the GPU's start and the accessibility
+        // adapter, one a turn, none while input waits; the loop turns again while some are owed.
         #[cfg(target_os = "windows")]
-        {
-            self.cpu_idle();
-            self.a11y_after_frame();
-        }
+        return self.post_frame_turn();
+        #[cfg(not(target_os = "windows"))]
         false
     }
 

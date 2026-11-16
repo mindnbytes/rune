@@ -41,12 +41,11 @@ impl<S: 'static> Runtime<S> {
     /// Queues `ev` for the `on_wheel` handlers it may go to; false leaves it to scrolling now.
     fn offer_wheel(&mut self, gesture: Attempt, ev: WheelEvent) -> bool {
         let lock = &self.wheel_lock;
-        let same_gesture = lock.owner_is_arriving();
         // A delta queued this frame may yet be taken: later ones wait their turn behind it.
         let pending = self.wheel_queued(Some(gesture));
         let (scrolls, handled) = match lock.owner() {
-            WheelOwner::Vertical | WheelOwner::Horizontal(_) => (same_gesture, false),
-            WheelOwner::Handler(_) => (false, same_gesture),
+            WheelOwner::Vertical | WheelOwner::Horizontal(_) => (true, false),
+            WheelOwner::Handler(_) => (false, true),
             WheelOwner::Unpicked => (false, false),
         };
         if scrolls && !pending { return false; }
@@ -64,17 +63,21 @@ impl<S: 'static> Runtime<S> {
     pub(super) fn run_wheel(&mut self, gesture: Attempt, chain: Vec<String>, ev: WheelEvent, phased: bool, tx: &mut Tx) -> bool {
         self.wheel_lock.sync_gesture(gesture);
         let mut taken = None;
-        if let WheelOwner::Handler(path) = self.wheel_lock.owner().clone() {
-            taken = self.call_wheel(&path, ev, tx);
-            if taken.is_none() { self.wheel_lock.set_owner(WheelOwner::Unpicked); }
-        } else if self.wheel_lock.owner() == &WheelOwner::Unpicked {
-            for path in chain {
-                if self.call_wheel(&path, ev, tx) == Some(true) {
-                    self.wheel_lock.set_owner(WheelOwner::Handler(path));
-                    taken = Some(true);
-                    break;
+        match self.wheel_lock.owner_of(gesture).cloned() {
+            Some(WheelOwner::Handler(path)) => {
+                taken = self.call_wheel(&path, ev, tx);
+                if taken.is_none() { self.wheel_lock.set_owner(gesture, WheelOwner::Unpicked); }
+            }
+            Some(WheelOwner::Unpicked) => {
+                for path in chain {
+                    if self.call_wheel(&path, ev, tx) == Some(true) {
+                        self.wheel_lock.set_owner(gesture, WheelOwner::Handler(path));
+                        taken = Some(true);
+                        break;
+                    }
                 }
             }
+            _ => {}
         }
         if taken.is_none() {
             self.wheel_scroll_for(gesture, ev.x, ev.y, ev.dx, ev.dy, phased);
@@ -188,6 +191,10 @@ impl<S: 'static> Runtime<S> {
         if self.autoscroll_press(button) { self.pointer = Some((x, y)); return; }
         if self.press.is_held() { return; }
         self.pointer = Some((x, y));
+        if button == PointerButton::Middle { self.tint_down(x, y, button); }
+        // On Linux a middle click in a text field pastes the primary selection there.
+        #[cfg(target_os = "linux")]
+        if button == PointerButton::Middle && self.primary_paste_down(x, y) { return; }
         self.dismiss_help();
         let hit = self.hits.iter().rev().find(|&&(id, r)| self.hit_contains(id, r, x, y)).and_then(|(id, _)| self.node_index.get(id).copied());
         let middle = button == PointerButton::Middle;
@@ -235,6 +242,7 @@ impl<S: 'static> Runtime<S> {
 
     /// A mouse button came up at (x, y): the release of [`Self::button_down`].
     pub fn button_up(&mut self, x: f32, y: f32, button: PointerButton) {
+        self.tint.release(button);
         if !matches!(button, PointerButton::Primary | PointerButton::Secondary) && self.autoscroll_release(button) { self.pointer = Some((x, y)); return; }
         match button {
             PointerButton::Primary => self.pointer_up(x, y),
@@ -478,6 +486,28 @@ mod tests {
         assert_eq!(rt.scrolls[&id].offset, 10.0, "only the newer gesture's own delta scrolled");
     }
 
+    /// A delta queued for the handler that has the gesture keeps reaching it when the gesture
+    /// ends and the next one scrolls at once, before the frame drains the queue.
+    #[test]
+    fn a_queued_delta_keeps_its_owner_when_the_next_gesture_scrolls_first() {
+        let mut rt = Runtime::new(Wheeled::default(), wheeling, (300.0, 300.0), Env::default());
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        // The handler takes the gesture.
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(110.0, 50.0));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.heard, [10.0]);
+        // A delta outside it is queued for that owner; the gesture ends, and the next one
+        // scrolls at once outside every handler.
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
+        rt.wheel_ended();
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.heard, [10.0, 190.0], "the queued delta still reaches the gesture's owner");
+        let id = rt.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
+        assert_eq!(rt.scrolls[&id].offset, 10.0, "only the newer gesture's own delta scrolled");
+    }
+
     #[derive(Default)]
     struct Two { heard: Vec<&'static str> }
 
@@ -489,6 +519,29 @@ mod tests {
                         .on_wheel(|s: &mut Two, _: crate::WheelEvent, _: &mut Tx| { s.heard.push("a"); true }))
                     .child(el().key("b").absolute(200.0, 40.0).size(40.0, 40.0)
                         .on_wheel(|s: &mut Two, _: crate::WheelEvent, _: &mut Tx| { s.heard.push("b"); true }))))
+    }
+
+    /// A gesture whose queued deltas have all run gives its owner's place up: the next gesture's
+    /// queued delta still reaches that gesture's handler instead of scrolling.
+    #[test]
+    fn a_drained_gesture_gives_its_owner_up_to_the_next_queued_one() {
+        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        // A delta over `a`, then a gesture begins and a delta over `b`: each reaches its own.
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
+        rt.wheel_began();
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.heard, ["a", "b"]);
+        // `b` owns the gesture now; a delta outside it is queued for `b`, and the next gesture
+        // begins before the frame drains it.
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
+        rt.wheel_began();
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.heard, ["a", "b", "b"], "the queued delta still reaches b");
+        let id = rt.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
+        assert_eq!(rt.scrolls[&id].offset, 0.0, "every delta reached a handler");
     }
 
     /// With a delta queued for a handler under one gesture and another under the next, each
@@ -504,5 +557,41 @@ mod tests {
         rt.wheel_began();
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.heard, ["a", "b"], "each delta goes to the handler its own gesture found");
+    }
+
+    /// Three gestures begin inside one frame, each with a delta queued for the handler under the
+    /// pointer: each delta reaches its own gesture's handler.
+    #[test]
+    fn three_gestures_queued_before_one_frame_each_reach_their_own_handler() {
+        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
+        rt.wheel_began();
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
+        rt.wheel_began();
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.heard, ["a", "b", "a"], "each delta goes to the handler its own gesture found");
+        let id = rt.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
+        assert_eq!(rt.scrolls[&id].offset, 0.0, "every delta reached a handler");
+    }
+
+    /// The third gesture scrolls at once outside every handler: the deltas queued for the first
+    /// two gestures still reach their own handlers, and only the third scrolls.
+    #[test]
+    fn a_third_gesture_scrolling_before_the_frame_keeps_both_queued_owners() {
+        let mut rt = Runtime::new(Two::default(), two_handlers, (300.0, 300.0), Env::default());
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(30.0, 50.0));
+        rt.wheel_began();
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(210.0, 50.0));
+        rt.wheel_began();
+        rt.wheel_event(crate::WheelEvent::new(0.0, -10.0).at(290.0, 50.0));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.heard, ["a", "b"], "the first two gestures' deltas still reach their handlers");
+        let id = rt.nodes.iter().find(|n| n.key.as_deref() == Some("list")).unwrap().id;
+        assert_eq!(rt.scrolls[&id].offset, 10.0, "only the third gesture's own delta scrolled");
     }
 }

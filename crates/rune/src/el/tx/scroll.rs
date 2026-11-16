@@ -1,5 +1,9 @@
 //! `Tx`'s scroll requests: revealing a row, moving a viewport to its end, a page or an
 //! offset, and holding an element where it shows.
+//!
+//! None of them follows the change's motion ([`Tx::motion`], [`Tx::motion_curve`]): a glide
+//! runs on `tok::motion::GLIDE`, or on the spring [`Tx::scroll_to_with`] takes, and every other
+//! request moves at once.
 
 #[cfg(doc)]
 use crate::El;
@@ -104,8 +108,11 @@ impl Tx {
     /// a page that opens on a heading lands it just under its bar. It's placed from the layout of the commit this
     /// handler causes, so the frame that first draws a new page draws it there, and unlike
     /// [`Tx::scroll_into_view`] where it lands doesn't depend on where the view was or what was
-    /// stuck over it. Instant; any momentum or glide stops. The element must be laid out: reveal
-    /// a virtual row that isn't mounted with [`Tx::scroll_into_view`].
+    /// stuck over it. Instant; any momentum or glide stops. A virtual row that isn't mounted
+    /// lands too: the jump goes where its list's estimates put it, which mounts it, and is placed
+    /// again from its layout before the frame draws, the rows it mounts there showing at once.
+    /// `"row/mark"` lands element or highlight `mark` anywhere inside the element keyed `row`,
+    /// including a virtual row that isn't mounted yet: one request, one jump.
     pub fn scroll_key_to(&mut self, key: impl Into<String>, at: f32) {
         self.scroll_offsets.push(crate::runtime::ScrollRequest { key: key.into(), x: None, y: Some(at), glide: None, anchor: true });
     }

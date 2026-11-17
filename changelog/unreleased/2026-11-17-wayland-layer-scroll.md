@@ -1,0 +1,1 @@
+- **Wayland layer-shell scrolling:** wheel and touchpad axis frames now reach Rune as phased wheel events, including discrete and high-resolution deltas.

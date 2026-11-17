@@ -31,7 +31,41 @@ use crate::{OverlayInput, OverlayOptions, OverlayPlacement};
 
 pub(crate) enum Input {
     Move(f32, f32), Leave, Button(bool), Secondary(bool), Key(crate::KeyEvent), KeyUp(crate::KeyEvent),
+    Wheel(crate::WheelEvent),
     Physical(crate::PhysicalInput, Option<crate::KeyEvent>),
+}
+
+#[derive(Default)]
+struct Axes {
+    horizontal: f64,
+    vertical: f64,
+    horizontal_discrete: Option<i32>,
+    vertical_discrete: Option<i32>,
+    horizontal_120: Option<i32>,
+    vertical_120: Option<i32>,
+    source: Option<wl_pointer::AxisSource>,
+    horizontal_stopped: bool,
+    vertical_stopped: bool,
+}
+
+impl Axes {
+    fn wheel(self, mods: crate::Mods, source: Option<wl_pointer::AxisSource>, gesture: &mut crate::platform::layer_scroll::State) -> Option<crate::WheelEvent> {
+        use crate::platform::layer_scroll::{Axis, Event, Frame, Source};
+        let source = match source {
+            Some(wl_pointer::AxisSource::Wheel) => Source::Wheel,
+            Some(wl_pointer::AxisSource::Finger) => Source::Finger,
+            Some(wl_pointer::AxisSource::Continuous) => Source::Continuous,
+            Some(wl_pointer::AxisSource::WheelTilt) => Source::WheelTilt,
+            _ => Source::Unknown,
+        };
+        let crate::platform::layer_scroll::Effect::Emit(scroll) = crate::platform::layer_scroll::step(gesture, Event::Frame(Frame {
+            horizontal: Axis { raw: self.horizontal, discrete: self.horizontal_discrete, value120: self.horizontal_120, stopped: self.horizontal_stopped },
+            vertical: Axis { raw: self.vertical, discrete: self.vertical_discrete, value120: self.vertical_120, stopped: self.vertical_stopped },
+            source,
+        }))?;
+        let phase = if scroll.ended { crate::GesturePhase::Ended } else if scroll.began { crate::GesturePhase::Began } else { crate::GesturePhase::Moved };
+        Some(crate::WheelEvent::new(scroll.dx, scroll.dy).mods(mods).phase(phase).precise(scroll.precise))
+    }
 }
 
 /// Whether the pointer is over the surface: the serial of its enter, which setting a cursor
@@ -53,6 +87,8 @@ struct State {
     /// drawable, and closing it is final.
     readiness: readiness::State,
     input: Vec<Input>,
+    axes: Axes,
+    axis_gesture: crate::platform::layer_scroll::State,
     surface: Option<WlSurface>,
     over: Over,
     keyboard_focus: bool,
@@ -102,6 +138,8 @@ impl State {
             if let Some(shape) = self.shape.take() { shape.destroy(); }
             if p.version() >= 3 { p.release(); }
             self.over = Over::Outside;
+            self.axes = Axes::default();
+            crate::platform::layer_scroll::step(&mut self.axis_gesture, crate::platform::layer_scroll::Event::Reset);
         }
         if !touch && let Some(t) = self.touch.take() {
             if t.version() >= 3 { t.release(); }
@@ -115,7 +153,7 @@ impl State {
     }
 }
 impl Dispatch<WlPointer, ()> for State {
-    fn event(state: &mut Self, _: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(state: &mut Self, pointer: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
             wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
                 // Until the surface sets a cursor, the pointer keeps the one it arrived with.
@@ -126,6 +164,8 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Motion { surface_x, surface_y, .. } if state.over.inside() => state.input.push(Input::Move(surface_x as f32, surface_y as f32)),
             wl_pointer::Event::Leave { surface, .. } if state.surface.as_ref() == Some(&surface) => {
                 state.over = Over::Outside;
+                state.axes = Axes::default();
+                crate::platform::layer_scroll::step(&mut state.axis_gesture, crate::platform::layer_scroll::Event::Reset);
                 state.input.push(Input::Leave);
             }
             wl_pointer::Event::Button { button: 0x110, state: wayland_client::WEnum::Value(button), .. } if state.over.inside() => {
@@ -139,8 +179,51 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Button { button: 0x111, state: wayland_client::WEnum::Value(button), .. } if state.over.inside() => {
                 state.input.push(Input::Secondary(button == wl_pointer::ButtonState::Pressed));
             }
+            wl_pointer::Event::Axis { axis, value, .. } if state.over.inside() => {
+                match axis {
+                    wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => state.axes.horizontal += value,
+                    wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll) => state.axes.vertical += value,
+                    _ => {}
+                }
+                if pointer.version() < 5 { emit_wheel(state, None); }
+            }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                state.axes.source = match axis_source {
+                    wayland_client::WEnum::Value(source) => Some(source),
+                    _ => None,
+                };
+            }
+            wl_pointer::Event::AxisStop { axis, .. } => match axis {
+                wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => state.axes.horizontal_stopped = true,
+                wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll) => state.axes.vertical_stopped = true,
+                _ => {}
+            },
+            wl_pointer::Event::AxisDiscrete { axis, discrete } => match axis {
+                wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => state.axes.horizontal_discrete = Some(discrete),
+                wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll) => state.axes.vertical_discrete = Some(discrete),
+                _ => {}
+            },
+            wl_pointer::Event::AxisValue120 { axis, value120 } => match axis {
+                wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => state.axes.horizontal_120 = Some(value120),
+                wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll) => state.axes.vertical_120 = Some(value120),
+                _ => {}
+            },
+            wl_pointer::Event::Frame => emit_wheel(state, Some(pointer)),
             _ => {}
         }
+    }
+}
+
+fn emit_wheel(state: &mut State, pointer: Option<&WlPointer>) {
+    let axes = std::mem::take(&mut state.axes);
+    if !state.over.inside() { return; }
+    let mods = state.xkb.as_ref().map(key_mods).unwrap_or_default();
+    let source = axes.source;
+    if let Some(wheel) = axes.wheel(mods, source, &mut state.axis_gesture) {
+        state.input.push(Input::Wheel(wheel));
+    }
+    if pointer.is_some_and(|pointer| pointer.version() < 5) {
+        crate::platform::layer_scroll::step(&mut state.axis_gesture, crate::platform::layer_scroll::Event::Reset);
     }
 }
 impl Dispatch<WlTouch, ()> for State {

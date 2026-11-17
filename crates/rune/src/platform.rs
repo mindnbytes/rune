@@ -10,6 +10,8 @@ pub(crate) mod ime;
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
 pub(crate) mod layer_shell;
 #[cfg(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+mod layer_scroll;
+#[cfg(any(test, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
 pub(crate) mod layer_shell_machine;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;

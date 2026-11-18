@@ -2090,17 +2090,32 @@ let clip = rune::Player::audio(note.path);
 
 `app.overlay(OverlaySpec { name, size, edge, margin, align, inset, interactive, view }, state)
 -> OverlayHandle<T>` adds a surface to that app's loop with its own state type: transparent,
-above every app, never keyboard-focused, never activating the app, on the top or bottom edge
-of the primary display, centred or `inset` points from a side. Clicks pass through unless
-`interactive`. `show()`, `hide()`, `place(edge, margin)`, `set_align(align, inset)`,
-`resize(size)` and `update(|t, tx| ..)` work from any thread; `availability()` reports
-`Unavailable` where the platform can't do it. An overlay is one more host on the event loop
-(it shares the GPU pool) but never keeps the loop alive alone.
+above ordinary windows where the host allows it, never activating the app, on the chosen
+display's top or bottom edge, centred or `inset` points from a side. A fullscreen view or
+compositor policy can still cover it. Keyboard focus is requested explicitly through
+`KeyPolicy::OnDemand` and `request_keys()`; showing alone never requests it. Host support
+differs: Wayland needs layer-shell v4 and a seat, macOS uses a non-activating panel, and
+Windows and X11 report non-activating keys unsupported. Clicks pass through
+unless `interactive` or `OverlayInput` opens a region. `show()`, `hide()`, `place(edge,
+margin)`, `set_align(align, inset)`, `resize(size)` and `update(|t, tx| ..)` work from any
+thread; `availability()` reports `Unavailable` where the platform can't do it. An overlay is
+one more host on the event loop (it shares the GPU pool) but never keeps the loop alive alone.
 
-- Wayland: a `zwlr_layer_shell_v1` surface on winit's display (overlay layer, keyboard none,
-  exclusive zone 0, empty input region), buffer scale from `preferred_buffer_scale`; hidden
-  means destroyed. Interactive overlays are unavailable there (pointer events for a surface on
-  a private queue aren't wired).
+- Wayland: a `zwlr_layer_shell_v1` surface on winit's display connection, in the overlay
+  layer by default (exclusive zone 0, empty input region); buffer scale from
+  `preferred_buffer_scale`. `OverlayInput::All` or `Regions` (from `.hit()` elements) wires
+  pointer hover, buttons and wheel input. `KeyPolicy::OnDemand` adds keys only after
+  `OverlayHandle::request_keys()` on a shown surface, and only when the surface has layer-shell
+  v4 and a seat; otherwise the surface stays unfocused. A hidden overlay is destroyed and made
+  again on its next show.
+  `.wayland_top_reserved(pixels)` on the configured overlay is the experimental reserved-bar
+  builder: it puts the surface on the top layer, anchors it top/left/right with the given
+  height, sets that positive exclusive zone, and overrides the placement options. Other
+  platforms ignore it. Layer stacking is compositor policy: on niri the reserved bar was
+  observed to disappear while a window was fullscreen, so do not assume it stays visible.
+  There is no capture exclusion or global pointer query, so
+  `follow_pointer` and moving an overlay with the pointer are unsupported there. See
+  [`examples/snowbar_probe.rs`](examples/snowbar_probe.rs) for a bar and a separate menu.
 - X11: an override-redirect notification window, empty input shape unless interactive.
 - macOS: winit's view (and the Metal layer wgpu draws into) moves into a non-activating
   `NSPanel` (`NonactivatingPanel`, `becomesKeyOnlyIfNeeded`) at status level (25) on every
@@ -2109,11 +2124,17 @@ of the primary display, centred or `inset` points from a side. Clicks pass throu
 - Windows: a topmost tool window with `WS_EX_NOACTIVATE` (plus `WS_EX_TRANSPARENT|WS_EX_LAYERED`
   unless interactive), shown with `SW_SHOWNOACTIVATE`; a bottom overlay sits above the taskbar
   (`platform/win32.rs`).
-- Checked under headless sway (layer shell, and Xwayland for X11) and on macOS (panel level,
-  bounds, hide and reshow). Windows builds are checked with `cargo xwin clippy` only.
+- The default overlay paths are checked under headless sway (layer shell, and Xwayland for
+  X11) and on macOS (panel level, bounds, hide and reshow). The reserved bar, pointer input
+  and on-demand keyboard focus have been exercised on niri with Snowbar. Horizontal layer
+  scrolling was observed there, but the full Wayland scroll path (device deltas, gesture
+  phases and wheel devices) is not verified. Hotplug, other compositors, other keyboard
+  layouts and capture exclusion also remain unverified. Windows builds are checked with
+  `cargo xwin clippy` only.
 - `Tx::copy` works in overlays (a meeting capsule's Copy button).
-- Unsupported: interactive overlays on Wayland, hover in a non-key macOS panel (mouse-moved events
-  go to the key window), per-monitor placement.
+- Unsupported: Wayland capture exclusion and global pointer queries; keyboard focus without
+  `KeyPolicy::OnDemand` and `request_keys()`, or without layer-shell v4; hover in a non-key
+  macOS panel (mouse-moved events go to the key window).
 
 ### Compositor hook (lighting and effects)
 

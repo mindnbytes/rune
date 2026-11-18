@@ -353,6 +353,7 @@ pub(crate) struct Overlay<T: 'static> {
     /// `ConfiguredOverlay::release_gpu_when_hidden` or `release_gpu_after`.
     release: Release,
     wayland_top_reserved: Option<u32>,
+    wayland_top_unreserved: bool,
     cursor: Option<crate::cursor::os::OsCursor>,
     mods: winit::keyboard::ModifiersState,
     renderer: Option<Renderer>,
@@ -385,7 +386,7 @@ pub(crate) struct Overlay<T: 'static> {
 
 impl<T: 'static> Overlay<T> {
     pub(crate) fn new<S>(configured: impl Into<ConfiguredOverlay<T>>, state: T, app: &AppSpec<S>) -> (Self, OverlayHandle<T>) {
-        let ConfiguredOverlay { spec, options, on_key, on_created, poll, on_focus, compositor, setup, srgb_blend, macos_level, modifier_keys, animate_reveal, release_after, wayland_top_reserved } = configured.into();
+        let ConfiguredOverlay { spec, options, on_key, on_created, poll, on_focus, compositor, setup, srgb_blend, macos_level, modifier_keys, animate_reveal, release_after, wayland_top_reserved, wayland_top_unreserved } = configured.into();
         let shared = Arc::new(Shared { native: Mutex::default(), requests: Mutex::default(), availability: AtomicU8::new(0), failure: Mutex::default(), surface: Mutex::default(), wake: Mutex::new(None), stats: Arc::default() });
         let meter = crate::frame::surface_stats::SurfaceMeter::new(spec.name, shared.stats.clone());
         let text = TextSystem::for_window(app.fonts, app.families);
@@ -417,6 +418,7 @@ impl<T: 'static> Overlay<T> {
             animate_reveal,
             options,
             wayland_top_reserved,
+            wayland_top_unreserved,
             canvas_size: spec.size,
             name: spec.name,
             at: Placement { size: spec.size, edge: spec.edge, margin: spec.margin, align: spec.align, inset: spec.inset },

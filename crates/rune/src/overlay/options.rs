@@ -150,6 +150,7 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub(crate) animate_reveal: bool,
     pub(crate) release_after: Option<std::time::Duration>,
     pub(crate) wayland_top_reserved: Option<u32>,
+    pub(crate) wayland_top_unreserved: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +221,11 @@ impl<T: 'static> ConfiguredOverlay<T> {
     /// On Wayland layer-shell, place on the top layer and reserve this many pixels.
     /// Other platforms ignore this prototype option.
     pub fn wayland_top_reserved(mut self, pixels: u32) -> Self { self.wayland_top_reserved = Some(pixels); self }
+    /// On Wayland layer-shell, place an unreserved overlay (exclusive zone 0) on the top
+    /// layer too, so a menu follows the bar behind fullscreen windows instead of staying
+    /// in the Overlay layer above them. Placement, size, input and focus are unchanged;
+    /// `wayland_top_reserved` keeps its own reservation. Other platforms ignore this.
+    pub fn wayland_top_unreserved(mut self) -> Self { self.wayland_top_unreserved = true; self }
     /// The macOS window level (`NSWindow.Level`, e.g. 3 for `.floating`), in place of
     /// `OverlayOptions::level`; `OverlayHandle::set_macos_level` changes it later. At any
     /// level a macOS overlay goes exactly where it's placed, over the menu bar too.
@@ -232,7 +238,7 @@ impl<T: 'static> OverlaySpec<T> {
     }
 
     pub fn options(self, options: OverlayOptions) -> ConfiguredOverlay<T> {
-        ConfiguredOverlay { spec: self, options, on_key: None, on_created: None, poll: None, on_focus: None, compositor: None, setup: None, srgb_blend: true, macos_level: None, modifier_keys: false, animate_reveal: false, release_after: None, wayland_top_reserved: None }
+        ConfiguredOverlay { spec: self, options, on_key: None, on_created: None, poll: None, on_focus: None, compositor: None, setup: None, srgb_blend: true, macos_level: None, modifier_keys: false, animate_reveal: false, release_after: None, wayland_top_reserved: None, wayland_top_unreserved: false }
     }
 }
 

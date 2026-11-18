@@ -231,7 +231,7 @@ impl<T: 'static> Overlay<T> {
             _ => None,
         };
         let wake = self.shared.wake.lock().unwrap().clone();
-        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, self.wayland_top_reserved, output, wake)?;
+        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, self.wayland_top_reserved, self.wayland_top_unreserved, output, wake)?;
         layer.set_buffer_scale(scale);
         if let Some((w, h)) = layer.configured_size() {
             if w > 0 { self.at.size.0 = w as f32; }

@@ -1,0 +1,1 @@
+- Wayland overlays can opt into the Top layer without reserving space, allowing a popover to follow a top bar's stacking without taking additional space from windows.

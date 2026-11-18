@@ -454,6 +454,16 @@ pub(crate) struct Changes {
     pub closed: bool,
 }
 
+/// The layer-shell policy for an overlay: reservation and an explicit unreserved Top
+/// choice are independent. Defaults still put an unreserved overlay on Overlay.
+fn layer_for(top_reserved: Option<u32>, top_unreserved: bool) -> Layer {
+    if top_reserved.is_some() || top_unreserved {
+        Layer::Top
+    } else {
+        Layer::Overlay
+    }
+}
+
 pub(crate) struct LayerSurface {
     registry: WlRegistry,
     seat_global: Option<(u32, u32)>,
@@ -473,7 +483,7 @@ pub(crate) struct LayerSurface {
 
 impl LayerSurface {
     /// None when the display isn't Wayland or the compositor lacks layer-shell.
-    pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, top_reserved: Option<u32>, output_id: Option<u32>, wake: Option<Waker>) -> Option<LayerSurface> {
+    pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, top_reserved: Option<u32>, top_unreserved: bool, output_id: Option<u32>, wake: Option<Waker>) -> Option<LayerSurface> {
         let RawDisplayHandle::Wayland(display) = display else { return None };
         // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
         // every overlay; a foreign backend never closes it.
@@ -497,9 +507,10 @@ impl LayerSurface {
         let region = compositor.create_region(&qh, ());
         surface.set_input_region(Some(&region));
         region.destroy();
-        // There is no layer above Overlay; layer choice is compositor policy.
+        // Layer and reservation are independent: a popover can follow the stacking of a
+        // reserved bar on Top without setting a positive exclusive zone of its own.
         let reserved = top_reserved;
-        let layer = shell.get_layer_surface(&surface, output.as_ref(), if reserved.is_some() { Layer::Top } else { Layer::Overlay }, namespace.to_owned(), &qh, ());
+        let layer = shell.get_layer_surface(&surface, output.as_ref(), layer_for(reserved, top_unreserved), namespace.to_owned(), &qh, ());
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_exclusive_zone(reserved.map_or(0, |pixels| pixels.min(i32::MAX as u32) as i32));
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
@@ -679,3 +690,7 @@ impl Drop for LayerSurface {
         let _ = self.queue.flush();
     }
 }
+
+#[cfg(test)]
+#[path = "layer_shell_tests.rs"]
+mod tests;

@@ -216,13 +216,13 @@ pub fn font_paths() -> [PathBuf; 2] {
 /// The system font file Rune loads for "System Font", when this machine has one.
 pub fn system_font_path() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") { return None; }
-    super::system_font_files(&["sfnsttf"]).into_iter().next()
+    crate::text::fonts::system_fonts::system_font_files(&["sfnsttf"]).into_iter().next()
 }
 
 /// The SF Mono file `Family::SystemMono` loads, when this machine has one.
 pub fn system_mono_path() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") { return None; }
-    super::system_font_files(&["sfnsmono"]).into_iter().find(|p| !p.to_string_lossy().to_lowercase().contains("italic"))
+    crate::text::fonts::system_fonts::system_font_files(&["sfnsmono"]).into_iter().find(|p| !p.to_string_lossy().to_lowercase().contains("italic"))
 }
 
 fn text_system() -> Result<TextSystem, String> {

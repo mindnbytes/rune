@@ -1,7 +1,8 @@
-// Written by `cargo run -p rune --example regen_dxbc` (or `RUNE_REGENERATE_DXBC=1 cargo test -p rune --lib uber_dxbc_is_fresh`) on Windows.
-pub(super) const UBER_DXBC_WGSL_BLAKE3: &str = "f4dd09f032914db84bf2a11afb8f375653a830409265cd9b2233e910419654a5";
+// Written by `cargo run -p rune --example regen_dxbc` on Windows, the one way to regenerate the uber bytecode:
+// it also writes the pinned fragments and their hashes (dxbc_pinned_hash.rs), which nothing else updates.
+pub(super) const UBER_DXBC_WGSL_BLAKE3: &str = "9aa7c38383028185adec6c1904c03cc5321f70df8364a8c7854e9779af80997a";
 pub(super) const UBER_DXBC_ABI_FNV64: u64 = 0x6b9932e7795ec011;
 #[cfg(test)]
-pub(super) const UBER_DXBC_HLSL_BLAKE3: &str = "fa5d59782e89718e155f052c9e1e307107641f67be4575c5516ae49bd4bac122";
+pub(super) const UBER_DXBC_HLSL_BLAKE3: &str = "ddaceaff671b0c855da37ade8086fe7aa2ddacf146d707862bce525667627c55";
 #[cfg(test)]
-pub(super) const UBER_DXBC_DUAL_HLSL_BLAKE3: &str = "09ede33f580fa82fa281ebe3cc8158538ca773ef8612151b162ef3217c5b9652";
+pub(super) const UBER_DXBC_DUAL_HLSL_BLAKE3: &str = "5c0642d50adedade4bbf996c5c58d944c912d6bca11401e73d47847de19f66f1";

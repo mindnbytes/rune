@@ -7,11 +7,10 @@
 use std::fmt::Write;
 
 use super::*;
-use crate::runtime::web_a11y::{anchor_id, aria_role, container_tag};
+use crate::a11y::roles;
+use crate::runtime::web_a11y::anchor_id;
 
-#[path = "export/css.rs"]
 mod css;
-#[path = "export/page.rs"]
 mod page;
 pub(crate) use page::page;
 
@@ -47,7 +46,7 @@ pub(crate) fn escape(s: &str) -> String {
     out
 }
 
-impl<S: 'static> Runtime<S> {
+impl RuntimeCore {
     /// The visible scene as `ExportNode`s: what `--html` writes for one width.
     pub(crate) fn export_nodes(&self) -> Vec<ExportNode> {
         let mut out = Vec::new();
@@ -55,8 +54,8 @@ impl<S: 'static> Runtime<S> {
         let mut stack: Vec<(usize, &'static str)> = Vec::new();
         let selects = self.page_text_selects();
         let mut i = 0;
-        while i < self.nodes.len() {
-            let n = &self.nodes[i];
+        while i < self.tree.nodes.len() {
+            let n = &self.tree.nodes[i];
             let end = self.subtree_end(i);
             while stack.last().is_some_and(|&(e, _)| i >= e) { stack.pop(); }
             if !self.allowed(i) || self.subtree_exiting(i) || n.vis.opacity <= 0.01 || n.input.is_some() {
@@ -90,14 +89,14 @@ impl<S: 'static> Runtime<S> {
     }
 
     fn export_node(&self, i: usize, depth: usize, inline: bool) -> ExportNode {
-        let n = &self.nodes[i];
+        let n = &self.tree.nodes[i];
         let mut attrs = String::new();
         let mut inner = String::new();
         let href = n.a11y.more.as_ref().and_then(|m| m.href.clone());
         let label = n.label.as_deref().filter(|s| !s.trim().is_empty());
         let pixels = n.vis.cold.pixels.as_ref().filter(|_| i + 1 == self.subtree_end(i));
         let pixels_url = pixels.and_then(|p| p.source_url());
-        let tag: &'static str = if let Some(t) = container_tag(n.role) {
+        let tag: &'static str = if let Some(t) = roles::container_tag(n.role) {
             t
         } else if href.is_some() {
             "a"
@@ -112,10 +111,10 @@ impl<S: 'static> Runtime<S> {
         } else {
             "div"
         };
-        if matches!(tag, "a" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6") || container_tag(n.role).is_some() {
+        if matches!(tag, "a" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6") || roles::container_tag(n.role).is_some() {
             if let Some(id) = anchor_id(n.key.as_deref()) { let _ = write!(attrs, " id=\"{id}\""); }
         }
-        if let Some(role) = aria_role(n.role) { let _ = write!(attrs, " role=\"{role}\""); }
+        if let Some(role) = roles::container_aria(n.role) { let _ = write!(attrs, " role=\"{role}\""); }
         if let Some(h) = &href { let _ = write!(attrs, " href=\"{}\"", escape(h)); }
         if let Some(url) = pixels_url {
             let [x0, y0, x1, y1] = n.target;
@@ -130,7 +129,7 @@ impl<S: 'static> Runtime<S> {
             let _ = write!(attrs, "{role} aria-label=\"{}\"", escape(l));
         }
         if n.a11y.hidden { attrs.push_str(" aria-hidden=\"true\""); }
-        let mut decls = css::layout(&self.layout.style(n.taffy).to_style(), i == 0);
+        let mut decls = css::layout(&self.commit.layout.style(n.taffy).to_style(), i == 0);
         let [x0, y0, x1, y1] = n.target;
         css::paint(&n.vis, (x1 - x0, y1 - y0), &mut decls);
         if let Some(spec) = n.text.as_deref() {
@@ -152,5 +151,4 @@ impl<S: 'static> Runtime<S> {
 }
 
 #[cfg(test)]
-#[path = "export/tests.rs"]
 mod tests;

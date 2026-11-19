@@ -76,10 +76,15 @@ impl Trace {
 
     /// Waits up to `wait` for the last frames' present times, then writes every held line.
     pub(crate) fn settle_presents(&mut self, wait: std::time::Duration) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = wait;
         let Some(presents) = self.presents.as_mut() else { return };
-        let until = Instant::now() + wait;
-        while presents.waiting() && Instant::now() < until {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let until = Instant::now() + wait;
+            while presents.waiting() && Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
         }
         presents.flush(&mut self.out);
     }
@@ -89,11 +94,19 @@ impl Trace {
         *self.ids.entry(key.to_owned()).or_insert(next)
     }
 
+    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn frame<S>(&mut self, rt: &mut Runtime<S>, t_ms: f64, cpu_ms: f64) {
-        self.frame_timed(rt, t_ms, cpu_ms, FrameTiming::default());
+        self.frame_timed_core(rt.core_mut(), t_ms, cpu_ms, FrameTiming::default());
     }
 
+    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn frame_timed<S>(&mut self, rt: &mut Runtime<S>, t_ms: f64, cpu_ms: f64, timing: FrameTiming) {
+        self.frame_timed_core(rt.core_mut(), t_ms, cpu_ms, timing);
+    }
+
+    pub(crate) fn frame_timed_core(&mut self, rt: &mut crate::runtime::RuntimeCore, t_ms: f64, cpu_ms: f64, timing: FrameTiming) {
         let els = rt.elements();
         let settled = rt.settled;
         let mut metas = Vec::new();
@@ -227,7 +240,7 @@ impl Trace {
             "cpu_ms": cpu_ms, "scene_edges": edges, "position_error_px": position_error,
             "retarget_lanes": retarget.lanes, "velocity_error_pt_s": retarget.max_velocity_error,
             "animating": rt.animating,
-            "why": crate::runtime::AnimSource::names(if rt.animating { rt.anim_sources } else { 0 }),
+            "why": crate::runtime::AnimSource::names(if rt.animating { rt.motion.anim_sources } else { 0 }),
         });
         // What the motion store spent this frame on, by traced element id (or path when untraced).
         let touched = rt.touched_tracks();
@@ -257,7 +270,7 @@ impl Trace {
         if !cuts.is_empty() {
             line["ai"] = cuts.into();
         }
-        if let Some(channels) = &rt.trace_channels {
+        if let Some(channels) = &rt.frame.trace_channels {
             for (&name, &(kind, value)) in channels { self.channels.sample(name, kind, value); }
         }
         let mut line = line.to_string();
@@ -290,7 +303,13 @@ impl Drop for Trace {
     }
 }
 
+#[cfg(any(test, feature = "hot"))]
+#[inline(always)]
 pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
+    tree_json_core(rt.core(), real_t)
+}
+
+pub(crate) fn tree_json_core(rt: &crate::runtime::RuntimeCore, real_t: f64) -> Value {
     let videos = rt.videos();
     let els: Vec<Value> = rt
         .elements()
@@ -378,7 +397,7 @@ pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
         "time_scale": rt.time_scale,
         "animating": rt.animating,
         "elements": els,
-        "warnings": rt.key_warnings.as_deref().unwrap_or_default(),
+        "warnings": rt.commit.key_warnings.as_deref().unwrap_or_default(),
     });
     if let Some(menu) = rt.popup_json() { tree["popupMenu"] = menu; }
     if let Some(dialog) = rt.file_dialog_json() { tree["fileDialog"] = dialog; }
@@ -388,7 +407,7 @@ pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
     if let Some((text, cursor)) = rt.focused_preedit() {
         tree["preedit"] = json!({ "text": text, "cursor": cursor.map(|(a, b)| [a, b]) });
     }
-    if let Some(title) = rt.window_title.current() { tree["title"] = title.into(); }
+    if let Some(title) = rt.host.window_title.current() { tree["title"] = title.into(); }
     if let Some((text, rect)) = rt.help_tooltip() { tree["tooltip"] = json!({ "text": text, "rect": rect.map(r2) }); }
     tree["accessibility"] = crate::a11y::dump::json(&rt.accessibility_tree(), false);
     tree
@@ -402,6 +421,7 @@ fn video_json(v: &crate::video::Snapshot) -> Value {
         PlayerState::Playing => ("playing", None),
         PlayerState::Ended => ("ended", None),
         PlayerState::Failed(e) => ("failed", Some(e.clone())),
+        _ => ("unknown", None),
     };
     let mut out = json!({
         "kind": match v.kind { crate::video::Kind::Video => "video", crate::video::Kind::Audio => "audio" },

@@ -8,11 +8,18 @@ const TAPS: usize = 128; // centre + ceil(3 * MAX_SIGMA / 2) pairs; padded for P
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Uniforms {
-    meta: [f32; 4], // used width, height, axis (0 horizontal), tap count
-    mapping: [f32; 4], // output->input scale xy
-    taps: [[f32; 4]; TAPS], // offset, weight; vec4 stride matches WGSL uniform arrays
+pub(super) struct Uniforms {
+    pub(super) meta: [f32; 4], // used width, height, axis (0 horizontal), tap count
+    pub(super) mapping: [f32; 4], // output->input scale xy
+    pub(super) taps: [[f32; 4]; TAPS], // offset, weight; vec4 stride matches WGSL uniform arrays
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<Uniforms>() == 2080);
+    assert!(std::mem::offset_of!(Uniforms, meta) == 0);
+    assert!(std::mem::offset_of!(Uniforms, mapping) == 16);
+    assert!(std::mem::offset_of!(Uniforms, taps) == 32);
+};
 
 pub(super) struct Pipeline {
     pipelines: [wgpu::RenderPipeline; 5],
@@ -59,7 +66,7 @@ impl Mode {
 }
 
 /// The pass's shader (`layer_blur.wgsl`).
-pub(crate) const WGSL: &str = include_str!("../layer_blur.wgsl");
+pub(crate) const WGSL: &str = include_str!("../shaders/layer_blur.wgsl");
 
 /// Each pipeline's `MODE` and `ADDITIVE` overrides, in `Pipeline::pipelines`' order.
 pub(crate) const MODES: [(f64, f64); 5] = [(0.0, 0.0), (0.0, 1.0), (2.0, 0.0), (2.0, 1.0), (3.0, 0.0)];

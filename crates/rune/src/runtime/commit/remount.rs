@@ -34,35 +34,35 @@ struct ListPlan {
     built_rows: Vec<(usize, El)>,
 }
 
-impl<S: 'static> Runtime<S> {
+impl RuntimeCore {
     /// Whether a commit that resized nothing and changed nothing the view reads
     /// ([`Runtime::commit_kind`]) only shifts or fills `virtual_rows` windows, so `view` and
     /// already mounted subtrees need not rebuild.
     pub(in crate::runtime) fn virtual_only(&self) -> bool {
         #[cfg(feature = "hot")]
-        if self.hot.is_some() {
+        if self.frame.hot.is_some() {
             return false;
         }
-        if self.checking_live_only() || self.virtuals.is_empty() || self.nodes.is_empty() {
+        if self.checking_live_only() || self.commit.virtuals.is_empty() || self.tree.nodes.is_empty() {
             return false;
         }
-        if !self.nodes.iter().all(|n| {
+        if !self.tree.nodes.iter().all(|n| {
             relayout::reusable(n) && n.text.as_ref().is_none_or(|t| !t.redacted && t.cold.live.is_none())
         }) {
             return false;
         }
-        for (path, v) in &self.virtuals {
+        for (path, v) in &self.commit.virtuals {
             if !v.indexed || !v.selection.pins.source().and_then(|s| s.rebuild()).is_some_and(|s| s.count == v.keys.len()) {
                 return false;
             }
-            let Some(&list_id) = self.path_ids.get(path) else { return false };
-            let Some(&list_idx) = self.node_index.get(&list_id) else { return false };
-            if !self.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.growth.is_some()) {
+            let Some(&list_id) = self.tree.path_ids.get(path) else { return false };
+            let Some(&list_idx) = self.tree.node_index.get(&list_id) else { return false };
+            if !self.tree.nodes.get(list_idx).is_some_and(|n| n.id == list_id && n.path == *path && n.growth.is_some()) {
                 return false;
             }
-            let Some(&scroll_id) = self.path_ids.get(&v.scroll_path) else { return false };
-            let Some(&scroll_idx) = self.node_index.get(&scroll_id) else { return false };
-            if !self.nodes.get(scroll_idx).is_some_and(|n| {
+            let Some(&scroll_id) = self.tree.path_ids.get(&v.scroll_path) else { return false };
+            let Some(&scroll_idx) = self.tree.node_index.get(&scroll_id) else { return false };
+            if !self.tree.nodes.get(scroll_idx).is_some_and(|n| {
                 n.id == scroll_id
                     && n.path == v.scroll_path
                     && n.scroll.is_some()
@@ -71,7 +71,7 @@ impl<S: 'static> Runtime<S> {
             }) {
                 return false;
             }
-            if self.virtuals.keys().any(|other| {
+            if self.commit.virtuals.keys().any(|other| {
                 other != path && other.strip_prefix(path.as_str()).is_some_and(|r| r.starts_with('/'))
             }) {
                 return false;
@@ -146,7 +146,7 @@ fn build_indexed_row(
     row
 }
 
-impl<S: 'static> Measurement<'_, S> {
+impl Measurement<'_> {
     pub(in crate::runtime) fn remount_virtuals(mut self) -> RemountOutcome {
         self.virtual_culled.clear();
         self.virtual_inputs.clear();
@@ -264,7 +264,7 @@ impl<S: 'static> Measurement<'_, S> {
             self.layout_seen.clone(),
         );
         let view_time = crate::frame::profile::Scope::new(crate::frame::profile::Phase::View);
-        let state = playground_host::handler_states_ref(self.state, self.playground);
+        let state = self.app.states_ref();
         let mut nested_virtual = false;
         for plan in &mut plans {
             let v = self.virtuals.get_mut(&plan.path).unwrap();
@@ -550,6 +550,7 @@ impl<S: 'static> Runtime<S> {
     /// Runs one remount pass on its own and says whether it fell back, so a test can read what
     /// the fallback left in the lists before the full rebuild that follows it fills them again.
     pub(in crate::runtime) fn remount_falls_back(&mut self) -> bool {
-        matches!(self.measurement(true).remount_virtuals(), RemountOutcome::Fallback)
+        let (core, app) = self.split_mut();
+        matches!(core.measurement(&app, true).remount_virtuals(), RemountOutcome::Fallback)
     }
 }

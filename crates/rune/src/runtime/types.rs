@@ -33,6 +33,9 @@ pub(crate) struct NodeCold {
     pub(super) scroll: Option<ScrollSpec>,
     pub(super) scroll_axes: crate::el::ScrollAxes,
     pub(super) scroll_edges: crate::el::ScrollEdges,
+    /// `El::wheel_scrolls`: the viewport a wheel over this node scrolls, in place of what it
+    /// starts on.
+    pub(super) wheel_scrolls: Option<Box<str>>,
     /// `El::sticky_top`, `El::sticky_bottom` and `El::stuck_shadow`.
     pub(super) sticky: Option<Box<crate::el::Sticky>>,
     pub(super) growth: Option<Box<GrowthSpec>>,
@@ -70,6 +73,7 @@ impl crate::cold::Empty for NodeCold {
         scroll: None,
         scroll_axes: crate::el::ScrollAxes::Y,
         scroll_edges: crate::el::ScrollEdges { fade: 0.0, fade_style: crate::el::FadeStyle::SMOOTH, margin: 0.0, anchor: false },
+        wheel_scrolls: None,
         sticky: None,
         growth: None,
         glide: None,
@@ -420,15 +424,27 @@ pub(super) struct ScrollState {
     pub(super) nudge: scroll_nudge::Nudge,
 }
 
-/// A scroll viewport's horizontal offset, momentum velocity and limit (points).
+/// What moves a viewport's horizontal offset, one motion at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum XMotion {
+    /// Where a hand, an app or a motion left it.
+    #[default]
+    Rest,
+    /// Coasting from a fling or a touch at `v` points a second, decaying.
+    Momentum(f32),
+    /// Gliding on a spring (`ScrollState::glide_spring`) at `v` points a second to `aim`
+    /// (`Tx::scroll_to`).
+    Glide { v: f32, aim: f64 },
+    /// Easing to where a notched mouse wheel sent it (`runtime/scroll/wheel.rs`).
+    Wheel(scroll_wheel::WheelCurve),
+}
+
+/// A scroll viewport's horizontal offset, motion and limit (points).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct AxisScroll {
     pub(super) offset: f64,
-    pub(super) v: f32,
+    pub(super) motion: XMotion,
     pub(super) max: f64,
-    /// Velocity of a glide to `aim` (`Tx::scroll_to`) while one runs.
-    pub(super) glide: Option<f32>,
-    pub(super) aim: f64,
     /// The viewport's flow (`El::dir`): right to left, its content starts at its right edge and
     /// `offset` counts how far it moved right, uncovering what is to the left.
     pub(super) flow: crate::el::Flow,
@@ -445,6 +461,21 @@ impl AxisScroll {
     /// `offset`.
     pub(super) fn toward(&self, delta: f64) -> f64 {
         match self.flow { crate::el::Flow::Ltr => -delta, crate::el::Flow::Rtl => delta }
+    }
+
+    /// Its momentum (points a second), 0 unless coasting.
+    pub(super) fn coast(&self) -> f32 {
+        match self.motion { XMotion::Momentum(v) => v, _ => 0.0 }
+    }
+
+    /// A glide or a wheel's ease moves it on its own.
+    pub(super) fn carried(&self) -> bool {
+        matches!(self.motion, XMotion::Glide { .. } | XMotion::Wheel(_))
+    }
+
+    /// Coasting at `v` from here; at 0 a coast stops, and a glide or a wheel's ease runs on.
+    pub(super) fn set_coast(&mut self, v: f32) {
+        if v != 0.0 { self.motion = XMotion::Momentum(v); } else if matches!(self.motion, XMotion::Momentum(_)) { self.motion = XMotion::Rest; }
     }
 }
 
@@ -528,6 +559,74 @@ pub struct FrameStats {
     pub layout_nodes: usize,
     pub glyphs: usize,
     pub shaped: u32,
+}
+
+/// Retained node tree, id/key lookup tables and per-commit node capability flags.
+/// Ordered hot-first under `#[repr(C)]` so `nodes`, per-commit capability flags and `node_index`
+/// sit at offset 0 (landing inside `RuntimeCore`'s 128-byte `disp8` window).
+#[repr(C)]
+pub(crate) struct TreeState {
+    pub(crate) nodes: Vec<Node>,
+    /// Some element is `El::sticky_top` or `El::sticky_bottom` (see `runtime/scroll/sticky.rs`).
+    pub(in crate::runtime) has_sticky: bool,
+    pub(in crate::runtime) has_dissolve: bool,
+    /// Some element is `El::raise`d: paint order isn't tree order.
+    pub(in crate::runtime) has_raise: bool,
+    /// Some element sets `El::paint_order`: its siblings paint out of tree order.
+    pub(in crate::runtime) has_paint_order: bool,
+    pub(in crate::runtime) has_cache: bool,
+    /// Some picture sizes a side from its image's ratio (`pixel_aspect`).
+    pub(in crate::runtime) has_pixel_aspect: bool,
+    pub(in crate::runtime) has_drawn_layout: bool,
+    pub(in crate::runtime) has_key_up: bool,
+    pub(in crate::runtime) node_index: HashMap<NodeId, usize>,
+    /// The node ids the last build indexed its scratch by.
+    pub(in crate::runtime) built_ids: Vec<NodeId>,
+    /// The last commit's node buffer, emptied, for the next flatten to fill: an app of a few
+    /// thousand elements otherwise maps and faults in megabytes every commit.
+    pub(in crate::runtime) spare_nodes: Vec<Node>,
+    pub(in crate::runtime) next_id: u64,
+    /// The node index the app's view returned when the playground is attached.
+    pub(crate) app_root: usize,
+    pub(in crate::runtime) path_ids: HashMap<String, NodeId>,
+    /// Pictures whose image changed shape since the last commit, which lays them out at once.
+    pub(in crate::runtime) aspect_snap: Vec<NodeId>,
+    /// `inh_scratch` and `row_dy` index `nodes`: no commit since the last build.
+    pub(in crate::runtime) built: bool,
+    /// Whether this runtime has an attached playground (`hooks.playground.is_some()`).
+    pub(crate) has_playground: bool,
+    pub(in crate::runtime) exit_mask: exit_mask::Mask,
+    pub(in crate::runtime) key_index: key_index::KeyIndex,
+}
+
+impl TreeState {
+    // Single-caller constructor for `RuntimeCore::new`; inlined so it stays in its caller's
+    // codegen unit instead of shifting partitioning and dropping inlining in the paint walk.
+    #[inline]
+    pub(in crate::runtime) fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            has_sticky: false,
+            has_dissolve: false,
+            has_raise: false,
+            has_paint_order: false,
+            has_cache: false,
+            has_pixel_aspect: false,
+            has_drawn_layout: false,
+            has_key_up: false,
+            built: false,
+            has_playground: false,
+            node_index: HashMap::default(),
+            path_ids: HashMap::default(),
+            spare_nodes: Vec::new(),
+            built_ids: Vec::new(),
+            aspect_snap: Vec::new(),
+            next_id: 1,
+            app_root: 0,
+            exit_mask: Default::default(),
+            key_index: Default::default(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -131,7 +131,10 @@ impl Desk {
         let before = self.focus.focused();
         let after = next.focused();
         if before != after {
-            if let Some(i) = before { self.members[i].focus(false); }
+            if let Some(i) = before {
+                if self.pointer == Pointer::Pressed(i) { self.pointer = Pointer::Over(i); }
+                self.members[i].focus(false);
+            }
             if let Some(i) = after { self.members[i].focus(true); }
         }
         self.focus = next;
@@ -456,6 +459,10 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
                     if let Some(i) = desk.focus.focused() { desk.members[i].input(&e.kind, (x, y)); }
                 }
                 Kind::Files(step) => desk.file_input(step, (x, y)),
+                &Kind::Resize(dw, dh) => {
+                    let i = desk.focus.key().unwrap_or(selected);
+                    desk.members[i].resize_by(dw, dh);
+                }
                 Kind::OpenUrl(_) => die("script open_url: a link opens in a single window's run (`--script` without a desktop)"),
                 // The rest are pointer input.
                 kind => {
@@ -497,7 +504,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
             }
             if slots[i].as_ref().is_none_or(|s| s.px != px) { slots[i] = Some(Slot::new(&gpu.device, &comp, px, scale)); }
             let slot = slots[i].as_ref().unwrap();
-            m.render(&gpu, slot, px, step, update_ms);
+            m.render(&gpu, slot, px, step, update_ms, frame_start);
             let (ox, oy) = desk.origin_px(i);
             let (sigma, offset, opacity) = if key == Some(i) { KEY_SHADOW } else { SHADOW };
             slot.write(&gpu.queue, Uniform {
@@ -558,6 +565,7 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
         }
     }
     for (shot, px) in readback.finish(&gpu.device) { deliver(shot, px); }
+    for m in &mut desk.members { m.flush_interaction(); }
     drop(deliver);
     if let Some(video) = writer.finish().unwrap_or_else(|e| die(&e)) {
         eprintln!("rune: wrote {} ({frames_written} frames at {fps} fps)", video.display());

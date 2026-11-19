@@ -7,10 +7,10 @@ use super::{
 use crate::el::{SelectRequest, SelectionCopy};
 use crate::runtime::selectable::phase::{self, Selection};
 use crate::runtime::selectable::{CopyJoin, SelectedText, TextSelection, floor_boundary};
-use crate::runtime::{Node, Runtime, playground_host};
+use crate::runtime::{Node, RuntimeCore, ViewDriver};
 
-impl<S: 'static> Runtime<S> {
-    pub(crate) fn copy_virtual_text(&self) -> Option<String> {
+impl RuntimeCore {
+    pub(crate) fn copy_virtual_text(&self, app: &dyn ViewDriver) -> Option<String> {
         let h = self.selection_holder_end()?;
         let f = self.focus_holder_end(h)?;
         let node_for = |e: EndRef| match e {
@@ -18,36 +18,37 @@ impl<S: 'static> Runtime<S> {
             EndRef::Offscreen(vi, ti) => self.live(&self.offscreen_text(vi, ti).list_path),
         };
         let (n0, n1) = (node_for(h)?, node_for(f)?);
-        let around = |a: usize, j: usize| std::iter::successors(Some(j), |&p| self.nodes[p].parent).any(|p| p == a);
-        let provider = std::iter::successors(Some(n0), |&p| self.nodes[p].parent)
-            .find(|&p| self.nodes[p].handlers.selection_copy.is_some() && around(p, n1));
+        let around = |a: usize, j: usize| std::iter::successors(Some(j), |&p| self.tree.nodes[p].parent).any(|p| p == a);
+        let provider = std::iter::successors(Some(n0), |&p| self.tree.nodes[p].parent)
+            .find(|&p| self.tree.nodes[p].handlers.selection_copy.is_some() && around(p, n1));
         if let Some(p) = provider
-            && let Some(copy_fn) = self.nodes[p].handlers.selection_copy.clone()
+            && let Some(copy_fn) = self.tree.nodes[p].handlers.selection_copy.clone()
         {
-            let sel = self.collect_virtual_selection(Some(p))?;
+            let sel = self.collect_virtual_selection(app, Some(p))?;
             if let Some(text) = copy_fn(&sel) {
                 return Some(text);
             }
             return Some(sel.text);
         }
-        self.collect_virtual_selection(None).map(|s| s.text)
+        self.collect_virtual_selection(app, None).map(|s| s.text)
     }
 
     /// Builds an unmounted row `r` of `list_path` on demand (view only, no layout/mount/GPU) and
     /// collects its selectable texts.
     pub(super) fn build_unmounted_row(
         &self,
+        app: &dyn ViewDriver,
         list_path: &str,
         r: usize,
         texts: &mut Vec<OffscreenText>,
         providers: &mut Vec<(String, SelectionCopy)>,
     ) {
-        let Some(v) = self.virtuals.get(list_path) else { return };
+        let Some(v) = self.commit.virtuals.get(list_path) else { return };
         let Some(key) = v.keys.get(r) else { return };
         let (group_path, inert) = (v.selection.scope.group_path.as_deref(), v.selection.scope.inert);
         match v.selection.pins.source() {
             Some(Source::Rebuild(rows)) => {
-                let state = playground_host::handler_states_ref(&self.state, self.playground.as_deref());
+                let state = app.states_ref();
                 let mut row = (rows.build)(state, r).key(key.clone());
                 if !crate::input::key_diagnostics::clean(&row) {
                     let _ = crate::input::key_diagnostics::repair_at(&mut row, &format!("{list_path}/{key}"));
@@ -66,8 +67,8 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Pins row `r` of `list_path` and ensures its offscreen texts are kept.
-    pub(crate) fn pin_offscreen_row(&mut self, list_path: &str, r: usize) {
-        let Some(v) = self.virtuals.get(list_path) else { return };
+    pub(crate) fn pin_offscreen_row(&mut self, app: &dyn ViewDriver, list_path: &str, r: usize) {
+        let Some(v) = self.commit.virtuals.get(list_path) else { return };
         if v.range.contains(&r) || r >= v.keys.len() {
             return;
         }
@@ -75,20 +76,20 @@ impl<S: 'static> Runtime<S> {
         let already = v.selection.pins.has_text_row(&row_key);
         let (mut texts, mut providers) = (Vec::new(), Vec::new());
         if !already {
-            self.build_unmounted_row(list_path, r, &mut texts, &mut providers);
+            self.build_unmounted_row(app, list_path, r, &mut texts, &mut providers);
         }
-        if let Some(v) = self.virtuals.get_mut(list_path) {
+        if let Some(v) = self.commit.virtuals.get_mut(list_path) {
             v.selection.pins.sync(PinsEvent::Pin { key: row_key, texts, providers });
         }
     }
 
     /// Collects the full [`TextSelection`] when the selection touches offscreen or unbuilt rows,
     /// bounded by [`MAX_VIRTUAL_COPY_ROWS`] and [`MAX_VIRTUAL_COPY_BYTES`].
-    pub(crate) fn collect_virtual_selection(&self, base: Option<usize>) -> Option<TextSelection> {
+    pub(crate) fn collect_virtual_selection(&self, app: &dyn ViewDriver, base: Option<usize>) -> Option<TextSelection> {
         let h = self.selection_holder_end()?;
         let f = self.focus_holder_end(h)?;
-        let sel = self.selectable.phase.selection()?;
-        let base_path = base.map(|b| self.nodes[b].path.as_str());
+        let sel = self.edit.selectable.phase.selection()?;
+        let base_path = base.map(|b| self.tree.nodes[b].path.as_str());
 
         if h == f {
             let (a, b) = (sel.anchor.min(sel.focus), sel.anchor.max(sel.focus));
@@ -121,7 +122,7 @@ impl<S: 'static> Runtime<S> {
         if let (EndRef::Offscreen(vi0, ti0), EndRef::Offscreen(vi1, ti1)) = (first_end, last_end)
             && vi0 == vi1
         {
-            let (_, v) = self.virtuals.iter().nth(vi0)?;
+            let (_, v) = self.commit.virtuals.iter().nth(vi0)?;
             let kept = v.selection.pins.texts();
             let row_key = &kept[ti0].row_key;
             if self.offscreen_text(vi1, ti1).row_key == *row_key {
@@ -151,13 +152,13 @@ impl<S: 'static> Runtime<S> {
             .map(|e| e.list_path)
             .or_else(|| {
                 let g = self.live(g_path)?;
-                let inside = |j: usize| j == g || std::iter::successors(self.nodes[j].parent, |&p| self.nodes[p].parent).any(|p| p == g);
-                (g..self.nodes.len())
+                let inside = |j: usize| j == g || std::iter::successors(self.tree.nodes[j].parent, |&p| self.tree.nodes[p].parent).any(|p| p == g);
+                (g..self.tree.nodes.len())
                     .take_while(|&j| inside(j))
-                    .find_map(|j| self.virtuals.contains_key(&self.nodes[j].path).then(|| self.nodes[j].path.clone()))
+                    .find_map(|j| self.commit.virtuals.contains_key(&self.tree.nodes[j].path).then(|| self.tree.nodes[j].path.clone()))
             })?;
         let list_node = self.live(&list_path)?;
-        let v = self.virtuals.get(&list_path)?;
+        let v = self.commit.virtuals.get(&list_path)?;
         let g = self.live(g_path)?;
 
         let (mut texts, mut out) = (Vec::new(), CopyJoin::default());
@@ -172,7 +173,7 @@ impl<S: 'static> Runtime<S> {
             let b = if end_ref == last_end { last_byte.min(len) } else { len };
             if a >= b { return false; }
             let piece = self.selected_piece(j, a..b, base);
-            let Some(spec) = self.nodes[j].text.as_ref() else { return false };
+            let Some(spec) = self.tree.nodes[j].text.as_ref() else { return false };
             let beside = prev_mounted.is_some_and(|p| self.beside(p, j));
             let capped = out.push(spec, a..b, piece.text(), beside, MAX_VIRTUAL_COPY_BYTES);
             texts.push(piece);
@@ -181,7 +182,7 @@ impl<S: 'static> Runtime<S> {
         };
 
         // 1. Mounted group members before `list_node`.
-        let inside_g = |j: usize| std::iter::successors(self.nodes[j].parent, |&p| self.nodes[p].parent).any(|p| p == g);
+        let inside_g = |j: usize| std::iter::successors(self.tree.nodes[j].parent, |&p| self.tree.nodes[p].parent).any(|p| p == g);
         for j in (g + 1..list_node).filter(|&j| inside_g(j) && self.member(j, g)) {
             if append_mounted(j, &mut out, &mut texts, &mut prev_mounted) {
                 hit_cap = true;
@@ -198,17 +199,17 @@ impl<S: 'static> Runtime<S> {
                 .filter(|e| e.list_path == list_path)
                 .map_or(v.keys.len() - 1, |e| e.row_index.min(v.keys.len() - 1));
 
-            let inside_list = |j: usize| std::iter::successors(self.nodes[j].parent, |&p| self.nodes[p].parent).any(|p| p == list_node);
-            let list_end = (list_node + 1..self.nodes.len()).take_while(|&j| inside_list(j)).last().unwrap_or(list_node);
+            let inside_list = |j: usize| std::iter::successors(self.tree.nodes[j].parent, |&p| self.tree.nodes[p].parent).any(|p| p == list_node);
+            let list_end = (list_node + 1..self.tree.nodes.len()).take_while(|&j| inside_list(j)).last().unwrap_or(list_node);
 
             for r in row_start..=row_end {
                 if v.range.contains(&r) {
                     let row_path = format!("{list_path}/{}", v.keys[r]);
                     let Some(row_node) = (list_node + 1..=list_end)
-                        .find(|&j| self.nodes[j].parent == Some(list_node) && self.nodes[j].path == row_path)
+                        .find(|&j| self.tree.nodes[j].parent == Some(list_node) && self.tree.nodes[j].path == row_path)
                     else { continue };
                     let inside_row = |j: usize| {
-                        j == row_node || std::iter::successors(self.nodes[j].parent, |&p| self.nodes[p].parent).any(|p| p == row_node)
+                        j == row_node || std::iter::successors(self.tree.nodes[j].parent, |&p| self.tree.nodes[p].parent).any(|p| p == row_node)
                     };
                     for j in (row_node..=list_end).take_while(|&j| inside_row(j)).filter(|&j| self.member(j, g)) {
                         if append_mounted(j, &mut out, &mut texts, &mut prev_mounted) {
@@ -230,7 +231,7 @@ impl<S: 'static> Runtime<S> {
                         }
                         unbuilt_rows += 1;
                         let mut ignored = Vec::new();
-                        self.build_unmounted_row(&list_path, r, &mut built_texts, &mut ignored);
+                        self.build_unmounted_row(app, &list_path, r, &mut built_texts, &mut ignored);
                         built_texts.iter().collect()
                     };
                     let mut first_in_row = true;
@@ -257,7 +258,7 @@ impl<S: 'static> Runtime<S> {
 
             // 3. Mounted group members after the virtual list's subtree.
             if !hit_cap {
-                for j in (list_end + 1..self.nodes.len()).take_while(|&j| inside_g(j)).filter(|&j| self.member(j, g)) {
+                for j in (list_end + 1..self.tree.nodes.len()).take_while(|&j| inside_g(j)).filter(|&j| self.member(j, g)) {
                     if append_mounted(j, &mut out, &mut texts, &mut prev_mounted) {
                         break;
                     }
@@ -271,29 +272,29 @@ impl<S: 'static> Runtime<S> {
 
     /// Finds the first and last selectable texts inside mounted node `root` (including unbuilt rows
     /// of any virtual list under `root`), pinning offscreen end rows as needed.
-    pub(crate) fn virtual_span_under(&mut self, root: usize) -> Option<(EndRef, EndRef)> {
+    pub(crate) fn virtual_span_under(&mut self, app: &dyn ViewDriver, root: usize) -> Option<(EndRef, EndRef)> {
         let inside = |nodes: &[Node], j: usize| {
             j == root || std::iter::successors(nodes[j].parent, |&p| nodes[p].parent).any(|p| p == root)
         };
-        let list_path = (root..self.nodes.len())
-            .take_while(|&j| inside(&self.nodes, j))
+        let list_path = (root..self.tree.nodes.len())
+            .take_while(|&j| inside(&self.tree.nodes, j))
             .find_map(|j| {
-                self.virtuals.get(&self.nodes[j].path)
+                self.commit.virtuals.get(&self.tree.nodes[j].path)
                     .filter(|v| !v.keys.is_empty())
-                    .map(|_| self.nodes[j].path.clone())
+                    .map(|_| self.tree.nodes[j].path.clone())
             })?;
         let list_node = self.live(&list_path)?;
-        let g_path = if self.nodes[root].selection_group {
-            Some(self.nodes[root].path.clone())
+        let g_path = if self.tree.nodes[root].selection_group {
+            Some(self.tree.nodes[root].path.clone())
         } else {
-            self.group_of(root).map(|g| self.nodes[g].path.clone())
+            self.group_of(root).map(|g| self.tree.nodes[g].path.clone())
         };
 
         // 1. Find the first selectable text under `root`.
         let first_before = (root..list_node)
-            .filter(|&j| inside(&self.nodes, j) && self.is_selectable(j) && !self.subtree_exiting(j) && self.allowed(j))
+            .filter(|&j| inside(&self.tree.nodes, j) && self.is_selectable(j) && !self.subtree_exiting(j) && self.allowed(j))
             .find(|&j| match &g_path {
-                Some(gp) => self.group_of(j).is_some_and(|g| &self.nodes[g].path == gp),
+                Some(gp) => self.group_of(j).is_some_and(|g| &self.tree.nodes[g].path == gp),
                 None => true,
             })
             .map(EndRef::Mounted);
@@ -302,21 +303,21 @@ impl<S: 'static> Runtime<S> {
         let first_end = if let Some(e) = first_before {
             Some(e)
         } else {
-            let count = self.virtuals[&list_path].keys.len();
+            let count = self.commit.virtuals[&list_path].keys.len();
             let mut found = None;
             for r in 0..count {
-                let range = self.virtuals[&list_path].range.clone();
+                let range = self.commit.virtuals[&list_path].range.clone();
                 if range.contains(&r) {
-                    let row_path = format!("{list_path}/{}", self.virtuals[&list_path].keys[r]);
-                    if let Some(j) = (list_node + 1..self.nodes.len())
-                        .take_while(|&j| inside(&self.nodes, j))
+                    let row_path = format!("{list_path}/{}", self.commit.virtuals[&list_path].keys[r]);
+                    if let Some(j) = (list_node + 1..self.tree.nodes.len())
+                        .take_while(|&j| inside(&self.tree.nodes, j))
                         .filter(|&j| {
-                            (self.nodes[j].path == row_path
-                                || self.nodes[j].path.strip_prefix(&row_path).is_some_and(|s| s.starts_with('/')))
+                            (self.tree.nodes[j].path == row_path
+                                || self.tree.nodes[j].path.strip_prefix(&row_path).is_some_and(|s| s.starts_with('/')))
                                 && self.is_selectable(j) && !self.subtree_exiting(j) && self.allowed(j)
                         })
                         .find(|&j| match &g_path {
-                            Some(gp) => self.group_of(j).is_some_and(|g| &self.nodes[g].path == gp),
+                            Some(gp) => self.group_of(j).is_some_and(|g| &self.tree.nodes[g].path == gp),
                             None => true,
                         })
                     {
@@ -325,7 +326,7 @@ impl<S: 'static> Runtime<S> {
                     }
                 } else {
                     let (mut texts, mut providers) = (Vec::new(), Vec::new());
-                    self.build_unmounted_row(&list_path, r, &mut texts, &mut providers);
+                    self.build_unmounted_row(app, &list_path, r, &mut texts, &mut providers);
                     if let Some(t) = texts.iter().find(|t| match &g_path {
                         Some(gp) => t.group_path.as_deref() == Some(gp.as_str()),
                         None => true,
@@ -336,7 +337,7 @@ impl<S: 'static> Runtime<S> {
                 }
             }
             if let Some((r, path)) = first_row_pin {
-                self.pin_offscreen_row(&list_path, r);
+                self.pin_offscreen_row(app, &list_path, r);
                 found = self.resolve_end(&path, None);
             }
             found
@@ -348,13 +349,13 @@ impl<S: 'static> Runtime<S> {
         };
 
         // 2. Find the last selectable text under `root` in `gp`.
-        let inside_list = |j: usize| std::iter::successors(self.nodes[j].parent, |&p| self.nodes[p].parent).any(|p| p == list_node);
-        let list_end = (list_node + 1..self.nodes.len()).take_while(|&j| inside_list(j)).last().unwrap_or(list_node);
-        let last_after = (list_end + 1..self.nodes.len())
-            .take_while(|&j| inside(&self.nodes, j))
+        let inside_list = |j: usize| std::iter::successors(self.tree.nodes[j].parent, |&p| self.tree.nodes[p].parent).any(|p| p == list_node);
+        let list_end = (list_node + 1..self.tree.nodes.len()).take_while(|&j| inside_list(j)).last().unwrap_or(list_node);
+        let last_after = (list_end + 1..self.tree.nodes.len())
+            .take_while(|&j| inside(&self.tree.nodes, j))
             .filter(|&j| {
                 self.is_selectable(j) && !self.subtree_exiting(j) && self.allowed(j)
-                    && self.group_of(j).is_some_and(|g| self.nodes[g].path == gp)
+                    && self.group_of(j).is_some_and(|g| self.tree.nodes[g].path == gp)
             })
             .last()
             .map(EndRef::Mounted);
@@ -362,19 +363,19 @@ impl<S: 'static> Runtime<S> {
         let last_end = if let Some(e) = last_after {
             e
         } else {
-            let count = self.virtuals[&list_path].keys.len();
+            let count = self.commit.virtuals[&list_path].keys.len();
             let mut last_row_pin: Option<(usize, String)> = None;
             let mut found = None;
             for r in (0..count).rev() {
-                let range = self.virtuals[&list_path].range.clone();
+                let range = self.commit.virtuals[&list_path].range.clone();
                 if range.contains(&r) {
-                    let row_path = format!("{list_path}/{}", self.virtuals[&list_path].keys[r]);
+                    let row_path = format!("{list_path}/{}", self.commit.virtuals[&list_path].keys[r]);
                     if let Some(j) = (list_node + 1..=list_end)
                         .filter(|&j| {
-                            (self.nodes[j].path == row_path
-                                || self.nodes[j].path.strip_prefix(&row_path).is_some_and(|s| s.starts_with('/')))
+                            (self.tree.nodes[j].path == row_path
+                                || self.tree.nodes[j].path.strip_prefix(&row_path).is_some_and(|s| s.starts_with('/')))
                                 && self.is_selectable(j) && !self.subtree_exiting(j) && self.allowed(j)
-                                && self.group_of(j).is_some_and(|g| self.nodes[g].path == gp)
+                                && self.group_of(j).is_some_and(|g| self.tree.nodes[g].path == gp)
                         })
                         .last()
                     {
@@ -383,7 +384,7 @@ impl<S: 'static> Runtime<S> {
                     }
                 } else {
                     let (mut texts, mut providers) = (Vec::new(), Vec::new());
-                    self.build_unmounted_row(&list_path, r, &mut texts, &mut providers);
+                    self.build_unmounted_row(app, &list_path, r, &mut texts, &mut providers);
                     if let Some(t) = texts.iter().rev().find(|t| t.group_path.as_deref() == Some(gp.as_str())) {
                         last_row_pin = Some((r, t.path.clone()));
                         break;
@@ -391,7 +392,7 @@ impl<S: 'static> Runtime<S> {
                 }
             }
             if let Some((r, path)) = last_row_pin {
-                self.pin_offscreen_row(&list_path, r);
+                self.pin_offscreen_row(app, &list_path, r);
                 found = self.resolve_end(&path, None);
             }
             found.unwrap_or(first_end)
@@ -403,38 +404,38 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Carries out a `Tx::select_text`, `select_all_text` or `clear_text_selection`.
-    pub(crate) fn select_request(&mut self, request: SelectRequest) {
-        let named = |key: &str| (0..self.nodes.len()).find(|&i| self.nodes[i].named(key) && !self.subtree_exiting(i) && self.allowed(i));
+    pub(crate) fn select_request(&mut self, app: &dyn ViewDriver, request: SelectRequest) {
+        let named = |key: &str| (0..self.tree.nodes.len()).find(|&i| self.tree.nodes[i].named(key) && !self.subtree_exiting(i) && self.allowed(i));
         match request {
             SelectRequest::Clear => self.clear_text_selection(),
             SelectRequest::Range(key, range) => {
                 let Some(i) = named(&key).filter(|&i| self.is_selectable(i)) else {
-                    self.select_unmounted_request(&SelectRequest::Range(key, range));
+                    self.select_unmounted_request(app, &SelectRequest::Range(key, range));
                     return;
                 };
                 let content = self.content_of(i).to_owned();
                 let (a, b) = (floor_boundary(&content, range.start), floor_boundary(&content, range.end.max(range.start)));
-                let path = self.nodes[i].path.clone();
+                let path = self.tree.nodes[i].path.clone();
                 self.select_step(phase::Event::Select(Selection::new(path, content, (a, b), (a, b))));
             }
             SelectRequest::All(key) => {
                 let Some(i) = named(&key) else {
-                    self.select_unmounted_request(&SelectRequest::All(key));
+                    self.select_unmounted_request(app, &SelectRequest::All(key));
                     return;
                 };
-                if let Some((first, last)) = self.virtual_span_under(i) {
+                if let Some((first, last)) = self.virtual_span_under(app, i) {
                     self.select_span_ends(first, last);
                     return;
                 }
-                if self.nodes[i].selection_group {
+                if self.tree.nodes[i].selection_group {
                     let members = self.group_texts(i);
                     if let (Some(&first), Some(&last)) = (members.first(), members.last()) {
                         self.select_span(first, last);
                         return;
                     }
                 }
-                let inside = |j: usize| j == i || std::iter::successors(self.nodes[j].parent, |&p| self.nodes[p].parent).any(|p| p == i);
-                let texts = || (i..self.nodes.len()).take_while(|&j| inside(j))
+                let inside = |j: usize| j == i || std::iter::successors(self.tree.nodes[j].parent, |&p| self.tree.nodes[p].parent).any(|p| p == i);
+                let texts = || (i..self.tree.nodes.len()).take_while(|&j| inside(j))
                     .filter(|&j| self.is_selectable(j) && !self.subtree_exiting(j) && self.allowed(j));
                 let Some(first) = texts().next() else { return };
                 let last = match self.group_of(first) {
@@ -448,27 +449,27 @@ impl<S: 'static> Runtime<S> {
 
     /// `select_request`, recording what an `El::on_selection_change` callback changed as already
     /// heard so it doesn't fire again on its own request.
-    pub(crate) fn apply_select_request(&mut self, request: SelectRequest, from_change: bool) {
-        self.select_request(request);
+    pub(crate) fn apply_select_request(&mut self, app: &dyn ViewDriver, request: SelectRequest, from_change: bool) {
+        self.select_request(app, request);
         if from_change {
-            let _ = self.selection_changes();
+            let _ = self.selection_changes(app);
         }
     }
 
     /// Handles `Tx::select_text` / `Tx::select_all_text` when `selector` names an element in an
     /// unbuilt virtual row.
-    pub(crate) fn select_unmounted_request(&mut self, request: &SelectRequest) -> bool {
+    pub(crate) fn select_unmounted_request(&mut self, app: &dyn ViewDriver, request: &SelectRequest) -> bool {
         let selector = match request {
             SelectRequest::Clear => return false,
             SelectRequest::Range(k, _) | SelectRequest::All(k) => k.as_str(),
         };
-        let lists: Vec<String> = self.virtuals.keys()
+        let lists: Vec<String> = self.commit.virtuals.keys()
             .filter(|lp| self.virtual_list_allowed(lp))
             .cloned()
             .collect();
 
         for list_path in lists {
-            let Some(v) = self.virtuals.get(&list_path) else { continue };
+            let Some(v) = self.commit.virtuals.get(&list_path) else { continue };
             let count = v.keys.len();
             let range = v.range.clone();
             let mut candidate_rows: Vec<usize> = (0..count)
@@ -485,7 +486,7 @@ impl<S: 'static> Runtime<S> {
             }
             for r in candidate_rows {
                 let (mut texts, mut providers) = (Vec::new(), Vec::new());
-                self.build_unmounted_row(&list_path, r, &mut texts, &mut providers);
+                self.build_unmounted_row(app, &list_path, r, &mut texts, &mut providers);
                 match request {
                     SelectRequest::Range(_, byte_range) => {
                         if let Some(t) = texts.iter().find(|t| t.path == selector || crate::flight::selects(selector, &t.path, t.key.as_deref())) {
@@ -495,7 +496,7 @@ impl<S: 'static> Runtime<S> {
                                 floor_boundary(&content, byte_range.start),
                                 floor_boundary(&content, byte_range.end.max(byte_range.start)),
                             );
-                            self.pin_offscreen_row(&list_path, r);
+                            self.pin_offscreen_row(app, &list_path, r);
                             let Some(end_ref) = self.resolve_end(&target_path, None) else { return false };
                             let mut sel = Selection::new(target_path, content, (a, b), (a, b));
                             sel.anchor_end = self.virtual_end_of(end_ref, a);
@@ -504,8 +505,8 @@ impl<S: 'static> Runtime<S> {
                         }
                     }
                     SelectRequest::All(_) => {
-                        let row_path = format!("{list_path}/{}", self.virtuals[&list_path].keys[r]);
-                        let row_key = &self.virtuals[&list_path].keys[r];
+                        let row_path = format!("{list_path}/{}", self.commit.virtuals[&list_path].keys[r]);
+                        let row_key = &self.commit.virtuals[&list_path].keys[r];
                         let row_matches = row_path == selector || crate::flight::selects(selector, &row_path, Some(row_key));
                         let matching: Vec<&OffscreenText> = if row_matches {
                             texts.iter().collect()
@@ -519,7 +520,7 @@ impl<S: 'static> Runtime<S> {
                                 None => first_t,
                             };
                             let (p0, p1) = (first_t.path.clone(), last_t.path.clone());
-                            self.pin_offscreen_row(&list_path, r);
+                            self.pin_offscreen_row(app, &list_path, r);
                             let (Some(e0), Some(e1)) = (self.resolve_end(&p0, None), self.resolve_end(&p1, None)) else { return false };
                             self.select_span_ends(e0, e1);
                             return true;
